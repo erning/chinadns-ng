@@ -46,12 +46,13 @@ const Query = struct {
     flags: Flags,
 
     pub const Flags = packed struct {
-        from: enum(u2) { udp, tcp, local }, // from.local: {fdobj, src_addr} = undefined
+        // from.local: {fdobj, src_addr} = undefined
+        from: enum(u2) { udp, tcp, local },
         verdict: enum(u2) { nil, is_china, non_china } = .nil, // [tag:none] `?bool` is better, but can't be used in packed struct
 
         /// query from udp/tcp client
         pub inline fn from_client(self: Flags) bool {
-            return self.from != .local;
+            return self.from == .udp or self.from == .tcp;
         }
 
         pub inline fn get_from_str(self: Flags) cc.ConstStr {
@@ -654,7 +655,7 @@ fn use_china_reply(msg: []const u8, qnamelen: c_int, p_test_res: *?dns.TestIpRes
 }
 
 /// [nosuspend]
-pub fn on_reply(rmsg: *RcMsg, upstream: *const Upstream) void {
+pub fn on_reply(rmsg: *RcMsg, upstream: *const Upstream, matched: bool) void {
     var msg = rmsg.msg();
 
     var ascii_namebuf: [c.DNS_NAME_MAXLEN:0]u8 = undefined;
@@ -681,6 +682,16 @@ pub fn on_reply(rmsg: *RcMsg, upstream: *const Upstream) void {
         .name = &ascii_namebuf,
         .url = upstream.url,
     } else undefined;
+
+    // passive health-check: a good reply (rcode noerror/nxdomain, not truncated) that
+    // actually answers one of this primary (non-fallback) upstream's outstanding queries
+    // means the group's primaries are alive. gated on `matched` (the upstream session's
+    // own qid set), not on the global query-list: while unhealthy the fallback may have
+    // already answered & removed the query, yet this "late" primary reply still matches
+    // the primary session's pending qid and is exactly the recovery signal — whereas a
+    // duplicate / unsolicited / spoofed reply that matches no outstanding qid is ignored.
+    if (matched and !upstream.fallback and dns.is_good(msg))
+        groups.get_upstream_group(upstream.tag).on_primary_alive(upstream.tag);
 
     const q = _query_list.get(msg) orelse {
         if (g.verbose())
