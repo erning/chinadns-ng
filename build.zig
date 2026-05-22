@@ -7,7 +7,7 @@ const Step = std.build.Step;
 const LibExeObjStep = std.build.LibExeObjStep;
 const OptionsStep = std.build.OptionsStep;
 
-const chinadns_version = "2025.08.09";
+const chinadns_version = "2026.05.22-dev";
 
 var _b: *Builder = undefined;
 
