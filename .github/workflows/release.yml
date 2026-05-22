@@ -1,0 +1,104 @@
+name: release
+
+# Build the full chinadns-ng release matrix (static musl binaries for every
+# target/cpu/flavor) by reusing the project's own build tooling: the pinned
+# Zig 0.10.1 Docker image (./Dockerfile) and tool/build-release.sh. This keeps
+# CI byte-for-byte identical to a local `tool/build-release.sh` run — the same
+# image bakes in the mips std patches and the soft-float mips wrapper, so there
+# is nothing toolchain-specific to re-implement here.
+#
+# Triggers:
+#   * push a version tag -> build everything, then create/update the matching
+#     GitHub Release and upload all binaries + SHA256SUMS. The tag must equal
+#     build.zig's chinadns_version; a tag with a pre-release suffix (e.g.
+#     2026.05.22-dev) is published as a GitHub pre-release, a bare date tag
+#     (e.g. 2026.05.22) as a full release.
+#   * manual run (workflow_dispatch) -> build everything, upload as workflow
+#     artifacts only (no Release touched).
+
+on:
+  push:
+    tags:
+      - '[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]'     # full release, e.g. 2026.05.22
+      - '[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*'   # pre-release, e.g. 2026.05.22-dev
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create/update the GitHub Release on tag builds
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full .git so build.zig can stamp the short commit id
+
+      - name: Read project version
+        id: ver
+        run: |
+          version=$(sed -nE 's/^const chinadns_version = "([^"]+)".*/\1/p' build.zig)
+          [ -n "$version" ] || { echo "could not read chinadns_version from build.zig" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # a pre-release suffix (anything after a '-', e.g. -dev / -rc1) marks a pre-release
+          case "$version" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "chinadns-ng version: $version (prerelease: $prerelease)"
+
+      - name: Guard tag matches build.zig version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${{ steps.ver.outputs.version }}"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag '$tag' does not match build.zig chinadns_version '$ver'" >&2
+            echo "bump chinadns_version in build.zig (or retag) so the release assets match the tag." >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build toolchain image (pinned zig 0.10.1)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: chinadns-ng-builder:0.10.1
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build release matrix
+        env:
+          IMAGE: chinadns-ng-builder:0.10.1   # matches the tag above; script skips its own docker build
+          OUT_DIR: dist                       # fixed output dir, version-independent paths below
+        run: tool/build-release.sh
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chinadns-ng-${{ steps.ver.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ steps.ver.outputs.prerelease }}
+          files: |
+            dist/chinadns-ng*
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
