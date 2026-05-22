@@ -159,6 +159,14 @@ pub fn on_start() void {
                     group.ipset_addctx = ipset.new_addctx(name46);
                     log.info(src, "tag:%s add ip to: %s", .{ tag.name(), name46 });
                 }
+
+                // [fallback / passive health-check]
+                if (group.upstream_group.has_fallback()) {
+                    if (!group.upstream_group.has_normal())
+                        break :e .{ .tag = tag, .msg = "fallback upstream without primary upstream" };
+                    Upstream.fallback_enable(&group.upstream_group, tag);
+                    log.info(src, "tag:%s ?fallback upstream(s): passive health-check enabled", .{tag.name()});
+                }
             }
 
             // [ip6 filter]

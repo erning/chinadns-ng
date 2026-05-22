@@ -41,6 +41,7 @@ count: ParamValue, // max queries per session (0 means no limit)
 life: ParamValue, // max lifetime(sec) per session (0 means no limit)
 proto: Proto,
 tag: Tag,
+fallback: bool, // queried (alongside primaries) only while the group is unhealthy; see Group.send
 
 const ParamValue = u16;
 const DEFAULT_COUNT: ParamValue = 10;
@@ -65,6 +66,7 @@ fn init(
     port: u16,
     count: ParamValue,
     life: ParamValue,
+    fallback: bool,
 ) Upstream {
     const dupe_host: ?cc.ConstStr = if (host.len > 0)
         (g.allocator.dupeZ(u8, host) catch unreachable).ptr
@@ -82,6 +84,8 @@ fn init(
         ip,
         // #port
         cc.b2v(proto.is_std_port(port), "", cc.snprintf(&portbuf, "#%u", .{cc.to_uint(port)})),
+        // ?fallback
+        cc.b2v(fallback, "?fallback", ""),
     });
     const dupe_url = (g.allocator.dupeZ(u8, cc.strslice_c(url)) catch unreachable).ptr;
 
@@ -93,6 +97,7 @@ fn init(
         .url = dupe_url,
         .count = count,
         .life = life,
+        .fallback = fallback,
     };
 }
 
@@ -140,6 +145,18 @@ fn session_eql(self: *const Upstream, in_session: ?*const anyopaque) bool {
 /// for check_timeout (response timeout)
 var _session_list: Node = undefined;
 
+/// groups with `?fallback` upstream(s), monitored by the passive health-check
+const FbGroup = struct { group: *Group, tag: Tag };
+var _fb_groups: [c.TAG_NONE + 1]FbGroup = undefined;
+var _fb_n: u8 = 0;
+
+/// for groups.zig: register a group whose primary upstreams are passively
+/// health-checked (the group has at least one `?fallback` upstream)
+pub fn fallback_enable(group: *Group, tag: Tag) void {
+    _fb_groups[_fb_n] = .{ .group = group, .tag = tag };
+    _fb_n += 1;
+}
+
 pub fn module_init() void {
     _session_list.init();
 }
@@ -163,6 +180,20 @@ pub fn check_timeout(timer: *EvLoop.Timer) void {
                 else
                     break;
             },
+        }
+    }
+
+    // passive health-check: flip a group to unhealthy once its primary upstreams
+    // have stayed unanswered for `timeout-sec`, so queries also go to ?fallback
+    const timeout_ms = cc.to_u64(g.upstream_timeout) * 1000;
+    var i: u8 = 0;
+    while (i < _fb_n) : (i += 1) {
+        const group = _fb_groups[i].group;
+        if (group.healthy and group.pending_since != 0 and
+            timer.check_deadline(group.pending_since + timeout_ms))
+        {
+            group.healthy = false;
+            log.warn(@src(), "tag:%s primary upstream(s) unresponsive, also querying ?fallback", .{_fb_groups[i].tag.name()});
         }
     }
 }
@@ -347,14 +378,16 @@ const UDP = struct {
 
             const prev_idle = self.is_idle();
 
-            // update query_list
+            // update query_list; `matched` = the reply answers one of this session's
+            // outstanding queries (gates the passive health-check recovery in on_reply)
+            var matched = false;
             if (len >= dns.header_len()) {
                 const qid = dns.get_id(rmsg.msg());
-                _ = self.query_list.remove(qid);
+                matched = self.query_list.remove(qid);
             }
 
             // will modify the msg.id
-            nosuspend server.on_reply(rmsg, self.upstream);
+            nosuspend server.on_reply(rmsg, self.upstream, matched);
 
             // all queries completed
             if (self.is_idle()) {
@@ -660,14 +693,16 @@ const TCP = struct {
     }
 
     /// remove qmsg from ack_list && qmsg.unref()
-    fn on_recv_msg(self: *TCP, rmsg: *const RcMsg) void {
+    /// returns whether the reply matched one of this session's outstanding queries
+    fn on_recv_msg(self: *TCP, rmsg: *const RcMsg) bool {
         const qid = dns.get_id(rmsg.msg());
         if (self.ack_list.fetchRemove(qid)) |kv| {
             self.pending_n -= 1;
             kv.value.unref();
-        } else {
-            log.warn(@src(), "unexpected msg_id:%u from %s", .{ cc.to_uint(qid), self.upstream.url });
+            return true;
         }
+        log.warn(@src(), "unexpected msg_id:%u from %s", .{ cc.to_uint(qid), self.upstream.url });
+        return false;
     }
 
     fn stop(self: *TCP) void {
@@ -803,11 +838,11 @@ const TCP = struct {
 
             const prev_idle = self.is_idle();
 
-            // update ack_list
-            self.on_recv_msg(rmsg);
+            // update ack_list; `matched` gates the passive health-check recovery
+            const matched = self.on_recv_msg(rmsg);
 
             // will modify the msg.id
-            nosuspend server.on_reply(rmsg, self.upstream);
+            nosuspend server.on_reply(rmsg, self.upstream, matched);
 
             // all queries completed
             if (self.is_idle()) {
@@ -1024,12 +1059,42 @@ pub const Proto = enum {
 pub const Group = struct {
     list: std.ArrayListUnmanaged(Upstream) = .{},
 
+    /// passive health of the primary (non-fallback) upstreams: \
+    /// `true`  → only primary upstreams are queried (steady state); \
+    /// `false` → fallback upstreams are queried *too* (primaries unresponsive). \
+    /// driven entirely by real query results, no active probing: a good reply \
+    /// from a primary sets it `true` (`on_primary_alive`); `pending_since` ageing \
+    /// out flips it `false` (`check_timeout`).
+    healthy: bool = true,
+
+    /// monotime(ms) of the oldest primary query left unanswered since the last \
+    /// good primary reply; 0 means nothing is outstanding. used to detect that \
+    /// all primary upstreams have gone silent. only meaningful for groups with \
+    /// `?fallback` upstream(s) (registered via `fallback_enable`).
+    pending_since: u64 = 0,
+
     pub inline fn items(self: *const Group) []Upstream {
         return self.list.items;
     }
 
     pub inline fn is_empty(self: *const Group) bool {
         return self.items().len == 0;
+    }
+
+    pub fn has_normal(self: *const Group) bool {
+        for (self.items()) |*upstream| {
+            if (!upstream.fallback)
+                return true;
+        }
+        return false;
+    }
+
+    pub fn has_fallback(self: *const Group) bool {
+        for (self.items()) |*upstream| {
+            if (upstream.fallback)
+                return true;
+        }
+        return false;
     }
 
     // ======================================================
@@ -1072,11 +1137,17 @@ pub const Group = struct {
 
         var count = DEFAULT_COUNT;
         var life = DEFAULT_LIFE;
+        var fallback = false;
 
-        // ?param=value
+        // ?param=value | ?flag
         while (std.mem.lastIndexOfScalar(u8, rest, '?')) |i| {
             const name_value = rest[i + 1 ..];
             rest = rest[0..i];
+            // valueless flags
+            if (std.mem.eql(u8, name_value, "fallback")) {
+                fallback = true;
+                continue;
+            }
             const sep = std.mem.indexOfScalar(u8, name_value, '=') orelse
                 return parse_failed("invalid param format", name_value);
             const name = name_value[0..sep];
@@ -1108,10 +1179,10 @@ pub const Group = struct {
 
         if (proto == .raw) {
             // `bind_tcp/bind_udp` conditions can't be checked because `opt.parse()` is being executed
-            self.do_add(tag, .udpi, host, ip, port, count, life);
-            self.do_add(tag, .tcpi, host, ip, port, count, life);
+            self.do_add(tag, .udpi, host, ip, port, count, life, fallback);
+            self.do_add(tag, .tcpi, host, ip, port, count, life, fallback);
         } else {
-            self.do_add(tag, proto, host, ip, port, count, life);
+            self.do_add(tag, proto, host, ip, port, count, life, fallback);
         }
     }
 
@@ -1124,6 +1195,7 @@ pub const Group = struct {
         port: u16,
         count: ParamValue,
         life: ParamValue,
+        fallback: bool,
     ) void {
         const addr = cc.SockAddr.from_text(cc.to_cstr(ip), port);
 
@@ -1131,12 +1203,13 @@ pub const Group = struct {
             if (upstream.eql(proto, &addr, host)) {
                 upstream.count = count;
                 upstream.life = life;
+                upstream.fallback = fallback;
                 return;
             }
         }
 
         const ptr = self.list.addOne(g.allocator) catch unreachable;
-        ptr.* = Upstream.init(tag, proto, &addr, host, ip, port, count, life);
+        ptr.* = Upstream.init(tag, proto, &addr, host, ip, port, count, life, fallback);
     }
 
     pub fn rm_useless(self: *Group) void {
@@ -1176,7 +1249,16 @@ pub const Group = struct {
 
         const in_proto: Proto = if (udpi) .udpi else .tcpi;
 
+        // primary upstreams are always queried; fallback upstreams are queried too
+        // only while the group is unhealthy (so they back up the primaries, while the
+        // primaries' real replies keep flowing in to detect recovery)
+        const send_fallback = !self.healthy;
+        var sent_primary = false;
+
         for (self.items()) |*upstream| {
+            if (upstream.fallback and !send_fallback)
+                continue;
+
             if (upstream.proto == .udpi or upstream.proto == .tcpi)
                 if (upstream.proto != in_proto) continue;
 
@@ -1188,6 +1270,24 @@ pub const Group = struct {
                 );
 
             nosuspend upstream.send(qmsg);
+
+            if (!upstream.fallback) sent_primary = true;
+        }
+
+        // passive health-check: remember when the primary path has an outstanding
+        // (so-far unanswered) query, so check_timeout can detect all-primary-down
+        if (sent_primary and self.pending_since == 0)
+            self.pending_since = g.evloop.time;
+    }
+
+    /// [passive health-check] a good reply just arrived from a primary (non-fallback)
+    /// upstream of this group → primaries are alive. clears the outstanding marker and,
+    /// if the group was unhealthy, switches back to primary-only.
+    pub fn on_primary_alive(self: *Group, tag: Tag) void {
+        self.pending_since = 0;
+        if (!self.healthy) {
+            self.healthy = true;
+            log.info(@src(), "tag:%s primary upstream(s) recovered, stop querying ?fallback", .{tag.name()});
         }
     }
 };
