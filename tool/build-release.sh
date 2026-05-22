@@ -108,7 +108,11 @@ run_build() {
 
     local -a eflags=()
     local kv; for kv in $envs; do eflags+=( -e "$kv" ); done
-    [ "$HOSTOS" = Linux ] && eflags+=( --user "$(id -u):$(id -g)" )
+    # On Linux run as the host user so artifacts are not root-owned. That uid has
+    # no /etc/passwd entry in the image, so HOME would default to "/" (unwritable)
+    # and zig's global-cache creation fails with "error: AccessDenied"; point HOME
+    # at a writable dir. (On macOS the container runs as root, so this is skipped.)
+    [ "$HOSTOS" = Linux ] && eflags+=( --user "$(id -u):$(id -g)" -e HOME=/tmp )
 
     local label="$flavor:$target@${cpu:-default}"
     local log="$LOGDIR/$(echo "$label" | tr '/:@+ ' '_____').log"
