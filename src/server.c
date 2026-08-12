@@ -1228,7 +1228,11 @@ static void tls_init(void) {
         log_error("unable to configure wolfSSL cipher list");
         exit(1);
     }
-    wolfSSL_CTX_set_options(tls_ctx, WOLFSSL_OP_NO_COMPRESSION | WOLFSSL_OP_NO_RENEGOTIATION);
+    long options = WOLFSSL_OP_NO_COMPRESSION;
+#if LIBWOLFSSL_VERSION_HEX >= 0x05006006
+    options |= WOLFSSL_OP_NO_RENEGOTIATION;
+#endif
+    wolfSSL_CTX_set_options(tls_ctx, options);
     if (!g_config.cert_verify) return;
     int ok;
     if (g_config.ca_certs) {
