@@ -191,31 +191,47 @@ class MockDoT:
 
 
 class ChinaDNS:
-    def __init__(self, binary, *args):
+    def __init__(self, binary, *args, bind_protocol=None, nofile_limit=None):
         self.port = free_port()
+        bind_port = str(self.port)
+        if bind_protocol:
+            bind_port += f"@{bind_protocol}"
         command = [
             binary,
             "--bind-addr", "127.0.0.1",
-            "--bind-port", str(self.port),
+            "--bind-port", bind_port,
             *args,
         ]
+        if nofile_limit is not None:
+            command = [
+                "sh", "-c", 'ulimit -n "$1"; shift; exec "$@"',
+                "sh", str(nofile_limit), *command,
+            ]
         self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        self.wait_ready()
+        self.wait_ready(bind_protocol)
 
-    def wait_ready(self):
+    def wait_ready(self, bind_protocol):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 output = self.process.stdout.read()
                 raise RuntimeError(f"chinadns-ng exited early:\n{output}")
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock_type = socket.SOCK_DGRAM if bind_protocol == "udp" else socket.SOCK_STREAM
+            sock = socket.socket(socket.AF_INET, sock_type)
             sock.settimeout(0.05)
             try:
+                if bind_protocol == "udp":
+                    sock.bind(("127.0.0.1", self.port))
+                    sock.close()
+                    time.sleep(0.02)
+                    continue
                 sock.connect(("127.0.0.1", self.port))
                 sock.close()
                 return
             except OSError:
                 sock.close()
+                if bind_protocol == "udp":
+                    return
                 time.sleep(0.02)
         raise TimeoutError("chinadns-ng did not start")
 
@@ -542,6 +558,25 @@ def check_rotation_and_timeout(binary):
         delayed.close()
 
 
+def check_resource_exhaustion(binary):
+    server = ChinaDNS(
+        binary,
+        "--default-tag", "chn",
+        "--china-dns", f"udp://127.0.0.1#{free_port()}?count=0?life=0",
+        bind_protocol="udp",
+        nofile_limit=6,
+    )
+    try:
+        try:
+            server.query("no-fd.example")
+            raise AssertionError("resource-exhausted query unexpectedly received a reply")
+        except TimeoutError:
+            pass
+        assert server.process.poll() is None
+    finally:
+        server.close()
+
+
 def check_verdict(binary):
     suffix = str(os.getpid())
     route4 = f"cdns_r4_{suffix}"
@@ -636,6 +671,7 @@ def main():
     check_cache(binary)
     check_config_and_groups(binary)
     check_rotation_and_timeout(binary)
+    check_resource_exhaustion(binary)
     if os.environ.get("CHINADNS_TEST_VERDICT") == "1":
         check_verdict(binary)
     if os.environ.get("CHINADNS_TEST_DOT") == "1":

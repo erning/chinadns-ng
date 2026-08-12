@@ -161,16 +161,20 @@ static struct ipset_addctx *ip_addctx[TAG_NONE + 1];
 static WOLFSSL_CTX *tls_ctx;
 #endif
 
-static void source_add(struct event_source *source, int fd, enum source_kind kind, u32 events) {
+static bool source_add(struct event_source *source, int fd, enum source_kind kind, u32 events) {
     source->fd = fd;
     source->kind = kind;
     source->events = events;
     source->closed = false;
     struct epoll_event ev = { .events = events, .data.ptr = source };
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        log_error("epoll add fd:%d failed: (%d) %s", fd, errno, strerror(errno));
-        exit(1);
+        log_warning("epoll add fd:%d failed: (%d) %s", fd, errno, strerror(errno));
+        close(fd);
+        source->fd = -1;
+        source->closed = true;
+        return false;
     }
+    return true;
 }
 
 static void source_mod(struct event_source *source, u32 events) {
@@ -523,8 +527,11 @@ static bool tcp_start(struct upstream_session *s) {
         s->retry_at = now_msec() + 1000;
         return false;
     }
-    source_add(&s->source, fd, SOURCE_UPSTREAM_TCP,
-        EPOLLIN | EPOLLOUT | EPOLLRDHUP);
+    if (!source_add(&s->source, fd, SOURCE_UPSTREAM_TCP,
+        EPOLLIN | EPOLLOUT | EPOLLRDHUP)) {
+        s->retry_at = now_msec() + 1000;
+        return false;
+    }
     s->u.tcp.state = TCP_CONNECTING;
     s->retry_at = 0;
     return true;
@@ -758,6 +765,21 @@ static void tcp_session_read(struct upstream_session *s) {
     }
 }
 
+static bool udp_start(struct upstream_session *s) {
+    int fd = new_socket(socket_addr_family(&s->config->addr), SOCK_DGRAM);
+    if (fd < 0) {
+        log_warning("socket(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
+        s->retry_at = now_msec() + 1000;
+        return false;
+    }
+    if (!source_add(&s->source, fd, SOURCE_UPSTREAM_UDP, EPOLLIN)) {
+        s->retry_at = now_msec() + 1000;
+        return false;
+    }
+    s->retry_at = 0;
+    return true;
+}
+
 static struct upstream_session *session_new(struct upstream_config *config) {
 #ifndef ENABLE_WOLFSSL
     if (config->proto == UP_TLS) {
@@ -778,12 +800,7 @@ static struct upstream_session *session_new(struct upstream_config *config) {
         s->u.tcp.state = TCP_DOWN;
         tcp_start(s);
     } else {
-        int fd = new_socket(socket_addr_family(&config->addr), SOCK_DGRAM);
-        if (fd < 0) {
-            log_error("socket(%s) failed: (%d) %s", config->url, errno, strerror(errno));
-            exit(1);
-        }
-        source_add(&s->source, fd, SOURCE_UPSTREAM_UDP, EPOLLIN);
+        udp_start(s);
     }
     return s;
 }
@@ -800,6 +817,12 @@ static void session_send(struct upstream_config *config, struct message *msg) {
     struct upstream_session *s = session_get(config);
     u16 qid = dns_get_id(msg->data);
     if (!s->tcp) {
+        if (s->source.closed && (!s->retry_at || now_msec() >= s->retry_at))
+            udp_start(s);
+        if (s->source.closed) {
+            ++s->query_count;
+            return;
+        }
         unsigned repeat = config->tag == TAG_GFW ? g_config.trustdns_packet_n : 1;
         bool any = false;
         for (unsigned i = 0; i < repeat; ++i) {
@@ -1046,16 +1069,24 @@ static void tcp_listener_accept(struct listener *listener) {
             SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0 && errno == ENOSYS) {
             fd = accept(listener->source.fd, (struct sockaddr *)&peer.storage, &peer.len);
-            if (fd >= 0) { set_nonblocking(fd); set_cloexec(fd); }
+            if (fd >= 0 && (set_nonblocking(fd) < 0 || set_cloexec(fd) < 0)) {
+                int error = errno;
+                close(fd);
+                fd = -1;
+                errno = error;
+            }
         }
         if (fd >= 0) {
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             struct tcp_client *client = xcalloc(1, sizeof(*client));
             client->peer = peer;
+            if (!source_add(&client->source, fd, SOURCE_TCP_CLIENT, EPOLLIN | EPOLLRDHUP)) {
+                free(client);
+                return;
+            }
             client->next = clients;
             clients = client;
-            source_add(&client->source, fd, SOURCE_TCP_CLIENT, EPOLLIN | EPOLLRDHUP);
         } else if (errno == EINTR) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1069,14 +1100,21 @@ static void tcp_listener_accept(struct listener *listener) {
 
 static struct listener *new_listener(const char *ip, u16 port, int type) {
     struct listener *listener = xcalloc(1, sizeof(*listener));
-    if (!socket_addr_parse(&listener->addr, ip, port)) return NULL;
+    if (!socket_addr_parse(&listener->addr, ip, port)) {
+        free(listener);
+        return NULL;
+    }
     int fd = new_socket(socket_addr_family(&listener->addr), type);
-    if (fd < 0) return NULL;
+    if (fd < 0) {
+        free(listener);
+        return NULL;
+    }
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     if (g_config.reuse_port && setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) < 0) {
         log_error("SO_REUSEPORT failed: (%d) %s", errno, strerror(errno));
         close(fd);
+        free(listener);
         return NULL;
     }
     if (bind(fd, (struct sockaddr *)&listener->addr.storage, listener->addr.len) < 0 ||
@@ -1088,10 +1126,13 @@ static struct listener *new_listener(const char *ip, u16 port, int type) {
     }
     snprintf(listener->ip, sizeof(listener->ip), "%s", ip);
     listener->port = port;
+    if (!source_add(&listener->source, fd,
+        type == SOCK_DGRAM ? SOURCE_UDP_LISTENER : SOURCE_TCP_LISTENER, EPOLLIN)) {
+        free(listener);
+        return NULL;
+    }
     listener->next = listeners;
     listeners = listener;
-    source_add(&listener->source, fd,
-        type == SOCK_DGRAM ? SOURCE_UDP_LISTENER : SOURCE_TCP_LISTENER, EPOLLIN);
     return listener;
 }
 
@@ -1125,7 +1166,10 @@ static void init_signal_source(void) {
         exit(1);
     }
     struct event_source *source = xcalloc(1, sizeof(*source));
-    source_add(source, fd, SOURCE_SIGNAL, EPOLLIN);
+    if (!source_add(source, fd, SOURCE_SIGNAL, EPOLLIN)) {
+        free(source);
+        exit(1);
+    }
 }
 
 static void cleanup_pending(void) {
