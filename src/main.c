@@ -20,6 +20,7 @@ static void init_domain_lists(void) {
         files[tag] = items;
     }
     dnl_init(files, g_config.gfwlist_first);
+    for (u8 tag = 0; tag <= TAG__MAX; ++tag) free((void *)files[tag]);
 }
 
 int main(int argc, char **argv) {

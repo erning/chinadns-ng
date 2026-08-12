@@ -150,6 +150,7 @@ static int epoll_fd = -1;
 static struct listener *listeners;
 static struct tcp_client *clients;
 static struct upstream_session *sessions;
+static struct event_source signal_source = { .fd = -1, .closed = true };
 static struct query **query_buckets;
 static size_t query_bucket_count;
 static struct list_node query_deadlines;
@@ -1186,9 +1187,7 @@ static void init_signal_source(void) {
         log_error("signalfd failed: %s", strerror(errno));
         exit(1);
     }
-    struct event_source *source = xcalloc(1, sizeof(*source));
-    if (!source_add(source, fd, SOURCE_SIGNAL, EPOLLIN)) {
-        free(source);
+    if (!source_add(&signal_source, fd, SOURCE_SIGNAL, EPOLLIN)) {
         exit(1);
     }
 }

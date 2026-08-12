@@ -707,7 +707,8 @@ def main():
     check_cache(binary)
     check_config_and_groups(binary)
     check_rotation_and_timeout(binary)
-    check_resource_exhaustion(binary)
+    if os.environ.get("CHINADNS_TEST_SKIP_RESOURCE") != "1":
+        check_resource_exhaustion(binary)
     check_hash_growth(binary)
     if os.environ.get("CHINADNS_TEST_VERDICT") == "1":
         check_verdict(binary)
