@@ -35,12 +35,12 @@ def question_end(message):
     return pos + 5
 
 
-def make_answer(query, address):
+def make_answer(query, address, ttl=60):
     end = question_end(query)
     ip = ipaddress.ip_address(address)
     qtype = 1 if ip.version == 4 else 28
     header = struct.pack("!HHHHHH", struct.unpack_from("!H", query)[0], 0x8180, 1, 1, 0, 0)
-    answer = struct.pack("!HHHIH", 0xC00C, qtype, 1, 60, len(ip.packed)) + ip.packed
+    answer = struct.pack("!HHHIH", 0xC00C, qtype, 1, ttl, len(ip.packed)) + ip.packed
     return header + query[12:end] + answer
 
 
@@ -55,10 +55,11 @@ def recv_exact(sock, size):
 
 
 class MockDNS:
-    def __init__(self, address, drop_first=0, close_after_reply=False):
+    def __init__(self, address, drop_first=0, close_after_reply=False, ttl=60):
         self.address = address
         self.drop_first = drop_first
         self.close_after_reply = close_after_reply
+        self.ttl = ttl
         self.port = free_port()
         self.stop_event = threading.Event()
         self.counts = {"udp": 0, "tcp": 0}
@@ -97,7 +98,7 @@ class MockDNS:
             if self.drop_first:
                 self.drop_first -= 1
                 continue
-            self.udp.sendto(make_answer(query, self.address), peer)
+            self.udp.sendto(make_answer(query, self.address, self.ttl), peer)
 
     def tcp_loop(self):
         while not self.stop_event.is_set():
@@ -120,7 +121,7 @@ class MockDNS:
                 if self.drop_first:
                     self.drop_first -= 1
                     continue
-                answer = make_answer(query, self.address)
+                answer = make_answer(query, self.address, self.ttl)
                 conn.sendall(struct.pack("!H", len(answer)) + answer)
                 if self.close_after_reply:
                     conn.shutdown(socket.SHUT_WR)
@@ -399,6 +400,29 @@ def check_cache(binary):
         )
         output = server.close()
         assert f"0 entries from {cache_db}" in output, output
+
+    with tempfile.TemporaryDirectory() as directory:
+        cache_db = os.path.join(directory, "large-ttl-cache.db")
+        mock = MockDNS("192.0.2.56", ttl=0x7FFFFFFF)
+        mock.start()
+        server = ChinaDNS(
+            binary,
+            "--default-tag", "chn",
+            "--china-dns", f"udp://127.0.0.1#{mock.port}?count=0?life=0",
+            "--cache", "8",
+            "--cache-refresh", "20",
+            "--cache-db", cache_db,
+        )
+        try:
+            assert answer_ip(server.query("large-ttl.example"))[0] == "192.0.2.56"
+        finally:
+            server.close()
+            mock.close()
+        with open(cache_db, "rb") as file:
+            header = file.read(struct.calcsize("=qIiiHBx"))
+        _, _, ttl, refresh_ttl, _, _ = struct.unpack("=qIiiHBx", header)
+        assert ttl == 0x7FFFFFFF
+        assert refresh_ttl == 0x7FFFFFFF * 20 // 100
 
 
 def check_config_and_groups(binary):

@@ -171,7 +171,8 @@ bool cache_add(void *reply, size_t len, int qnamelen, i32 *ttl) {
     e->update_time = time(NULL);
     e->hash = hash;
     e->ttl = value;
-    e->refresh_ttl = value * g_config.cache_refresh / 100;
+    i64 refresh_ttl = (i64)value * g_config.cache_refresh / 100;
+    e->refresh_ttl = refresh_ttl > INT32_MAX ? INT32_MAX : (i32)refresh_ttl;
     e->msg_len = (u16)len;
     e->qnamelen = (u8)qnamelen;
     e->added_ip = true;
