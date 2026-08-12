@@ -24,7 +24,11 @@ struct rr_entry {
     u8 name[];
 };
 
-static struct rr_entry *buckets[256];
+#define RR_INITIAL_BUCKETS 256
+
+static struct rr_entry **buckets;
+static size_t bucket_count;
+static size_t entry_count;
 
 struct struct_alignto(1) rr_head {
     u16 name;
@@ -37,7 +41,7 @@ struct struct_alignto(1) rr_head {
 STATIC_ASSERT(sizeof(struct rr_head) == 12);
 
 static struct rr_entry *find_entry(const void *name, size_t len, u32 hash) {
-    for (struct rr_entry *e = buckets[hash & 255]; e; e = e->next)
+    for (struct rr_entry *e = buckets[hash & (bucket_count - 1)]; e; e = e->next)
         if (e->hash == hash && e->name_len == len && memcmp(e->name, name, len) == 0)
             return e;
     return NULL;
@@ -47,13 +51,31 @@ static struct rr_entry *get_entry(const void *name, size_t len) {
     u32 hash = calc_hashv(name, len);
     struct rr_entry *e = find_entry(name, len, hash);
     if (e) return e;
+    if (entry_count >= bucket_count * 2) {
+        size_t new_count = bucket_count * 2;
+        struct rr_entry **new_buckets = xcalloc(new_count, sizeof(*new_buckets));
+        for (size_t i = 0; i < bucket_count; ++i) {
+            struct rr_entry *item = buckets[i];
+            while (item) {
+                struct rr_entry *next = item->next;
+                size_t idx = item->hash & (new_count - 1);
+                item->next = new_buckets[idx];
+                new_buckets[idx] = item;
+                item = next;
+            }
+        }
+        free(buckets);
+        buckets = new_buckets;
+        bucket_count = new_count;
+    }
     e = xcalloc(1, sizeof(*e) + len);
     e->hash = hash;
     e->name_len = (u16)len;
     memcpy(e->name, name, len);
-    size_t idx = hash & 255;
+    size_t idx = hash & (bucket_count - 1);
     e->next = buckets[idx];
     buckets[idx] = e;
+    ++entry_count;
     return e;
 }
 
@@ -167,6 +189,8 @@ static bool read_hosts(const char *path) {
 }
 
 void local_rr_init(void) {
+    bucket_count = RR_INITIAL_BUCKETS;
+    buckets = xcalloc(bucket_count, sizeof(*buckets));
     for (size_t i = 0; i < g_config.hosts_files.len; ++i)
         if (!read_hosts(g_config.hosts_files.items[i])) exit(2);
     for (size_t i = 0; i < g_config.local_rr.len; ++i)

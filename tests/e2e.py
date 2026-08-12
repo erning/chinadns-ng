@@ -282,6 +282,17 @@ class ChinaDNS:
             length = struct.unpack("!H", recv_exact(sock, 2))[0]
             return recv_exact(sock, length)
 
+    def query_after_pending_udp(self, count, final_name):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2)
+        with sock:
+            for ident in range(count):
+                query = make_query(f"pending-{ident}.example", 1, ident & 0xFFFF)
+                sock.sendto(query, ("127.0.0.1", self.port))
+            query = make_query(final_name, 1, 0x7777)
+            sock.sendto(query, ("127.0.0.1", self.port))
+            return sock.recv(4096)
+
     def invalid_query(self, tcp=False):
         query = struct.pack("!HHHHHH", 0x7788, 0x0100, 1, 0, 0, 0)
         if tcp:
@@ -577,6 +588,31 @@ def check_resource_exhaustion(binary):
         server.close()
 
 
+def check_hash_growth(binary):
+    with tempfile.TemporaryDirectory() as directory:
+        hosts = os.path.join(directory, "many-hosts")
+        with open(hosts, "w", encoding="utf-8") as file:
+            for value in range(600):
+                file.write(f"192.0.2.{value % 250 + 1} host-{value}.local\n")
+        server = ChinaDNS(binary, "--hosts", hosts, "--default-tag", "chn")
+        try:
+            assert answer_ip(server.query("host-599.local"))[0] == "192.0.2.100"
+        finally:
+            server.close()
+
+    server = ChinaDNS(
+        binary,
+        "--default-tag", "chn",
+        "--china-dns", f"udp://127.0.0.1#{free_port()}?count=0?life=0",
+        "--dns-rr-ip", "ready.local=192.0.2.101",
+    )
+    try:
+        reply = server.query_after_pending_udp(2500, "ready.local")
+        assert answer_ip(reply)[0] == "192.0.2.101"
+    finally:
+        server.close()
+
+
 def check_verdict(binary):
     suffix = str(os.getpid())
     route4 = f"cdns_r4_{suffix}"
@@ -672,6 +708,7 @@ def main():
     check_config_and_groups(binary)
     check_rotation_and_timeout(binary)
     check_resource_exhaustion(binary)
+    check_hash_growth(binary)
     if os.environ.get("CHINADNS_TEST_VERDICT") == "1":
         check_verdict(binary)
     if os.environ.get("CHINADNS_TEST_DOT") == "1":

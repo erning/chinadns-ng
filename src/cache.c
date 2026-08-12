@@ -10,7 +10,7 @@
 #include <string.h>
 #include <time.h>
 
-#define CACHE_BUCKETS 256
+#define CACHE_MIN_BUCKETS 256
 
 struct cache_entry {
     struct cache_entry *hash_next;
@@ -40,7 +40,8 @@ struct ignored_domain {
     u8 wire[];
 };
 
-static struct cache_entry *cache_buckets[CACHE_BUCKETS];
+static struct cache_entry **cache_buckets;
+static size_t cache_bucket_count;
 static struct list_node cache_lru;
 static size_t cache_count;
 static struct ignored_domain *ignored_domains;
@@ -54,7 +55,8 @@ struct verdict_entry {
     u8 name[];
 };
 
-static struct verdict_entry *verdict_buckets[CACHE_BUCKETS];
+static struct verdict_entry **verdict_buckets;
+static size_t verdict_bucket_count;
 static struct list_node verdict_fifo;
 static size_t verdict_count;
 
@@ -66,10 +68,16 @@ static size_t question_len(int qnamelen) {
     return dns_question_len(qnamelen);
 }
 
+static size_t bucket_count_for(size_t capacity) {
+    size_t count = CACHE_MIN_BUCKETS;
+    while (count < capacity) count *= 2;
+    return count;
+}
+
 static struct cache_entry *cache_find(const void *query, int qnamelen, u32 hash) {
     const u8 *question = question_ptr(query);
     size_t len = question_len(qnamelen);
-    for (struct cache_entry *e = cache_buckets[hash & (CACHE_BUCKETS - 1)]; e; e = e->hash_next) {
+    for (struct cache_entry *e = cache_buckets[hash & (cache_bucket_count - 1)]; e; e = e->hash_next) {
         if (e->hash == hash && question_len(e->qnamelen) == len &&
             memcmp(question_ptr(e->msg), question, len) == 0)
             return e;
@@ -78,7 +86,7 @@ static struct cache_entry *cache_find(const void *query, int qnamelen, u32 hash)
 }
 
 static void cache_unlink_hash(struct cache_entry *entry) {
-    size_t idx = entry->hash & (CACHE_BUCKETS - 1);
+    size_t idx = entry->hash & (cache_bucket_count - 1);
     struct cache_entry **p = &cache_buckets[idx];
     while (*p && *p != entry) p = &(*p)->hash_next;
     if (*p) *p = entry->hash_next;
@@ -177,7 +185,7 @@ bool cache_add(void *reply, size_t len, int qnamelen, i32 *ttl) {
     e->qnamelen = (u8)qnamelen;
     e->added_ip = true;
     memcpy(e->msg, reply, len);
-    size_t idx = hash & (CACHE_BUCKETS - 1);
+    size_t idx = hash & (cache_bucket_count - 1);
     e->hash_next = cache_buckets[idx];
     cache_buckets[idx] = e;
     list_insert_after(&cache_lru, &e->lru);
@@ -213,7 +221,7 @@ static void cache_load(void) {
         e->added_ip = false;
         i32 remain = e->ttl - (i32)max((time_t)0, time(NULL) - e->update_time);
         if (!ttl_usable(remain)) { free(e); continue; }
-        size_t idx = e->hash & (CACHE_BUCKETS - 1);
+        size_t idx = e->hash & (cache_bucket_count - 1);
         e->hash_next = cache_buckets[idx];
         cache_buckets[idx] = e;
         list_insert_before(&cache_lru, &e->lru);
@@ -249,7 +257,7 @@ void cache_dump(bool manual) {
 static struct verdict_entry *verdict_find(const void *query, int qnamelen, u32 hash) {
     const u8 *name = question_ptr(query);
     size_t len = (size_t)qnamelen - 1;
-    for (struct verdict_entry *e = verdict_buckets[hash & (CACHE_BUCKETS - 1)]; e; e = e->hash_next)
+    for (struct verdict_entry *e = verdict_buckets[hash & (verdict_bucket_count - 1)]; e; e = e->hash_next)
         if (e->hash == hash && e->name_len == len && memcmp(e->name, name, len) == 0) return e;
     return NULL;
 }
@@ -264,7 +272,7 @@ bool verdict_cache_get(const void *query, int qnamelen, bool *is_china) {
 }
 
 static void verdict_remove(struct verdict_entry *e) {
-    size_t idx = e->hash & (CACHE_BUCKETS - 1);
+    size_t idx = e->hash & (verdict_bucket_count - 1);
     struct verdict_entry **p = &verdict_buckets[idx];
     while (*p && *p != e) p = &(*p)->hash_next;
     if (*p) *p = e->hash_next;
@@ -286,7 +294,7 @@ void verdict_cache_add(const void *query, int qnamelen, bool is_china) {
     e->name_len = (u16)len;
     e->is_china = is_china;
     memcpy(e->name, question_ptr(query), len);
-    size_t idx = hash & (CACHE_BUCKETS - 1);
+    size_t idx = hash & (verdict_bucket_count - 1);
     e->hash_next = verdict_buckets[idx];
     verdict_buckets[idx] = e;
     list_insert_before(&verdict_fifo, &e->fifo);
@@ -341,6 +349,14 @@ void verdict_cache_dump(bool manual) {
 void cache_init(void) {
     list_init(&cache_lru);
     list_init(&verdict_fifo);
+    if (g_config.cache_size) {
+        cache_bucket_count = bucket_count_for(g_config.cache_size);
+        cache_buckets = xcalloc(cache_bucket_count, sizeof(*cache_buckets));
+    }
+    if (g_config.verdict_cache_size) {
+        verdict_bucket_count = bucket_count_for(g_config.verdict_cache_size);
+        verdict_buckets = xcalloc(verdict_bucket_count, sizeof(*verdict_buckets));
+    }
     for (size_t i = 0; i < g_config.cache_ignore.len; ++i)
         add_ignored_domain(g_config.cache_ignore.items[i]);
     cache_load();

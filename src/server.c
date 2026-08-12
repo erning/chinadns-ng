@@ -30,7 +30,7 @@
 #endif
 
 #define MAX_EVENTS 64
-#define QUERY_BUCKETS 1024
+#define QUERY_INITIAL_BUCKETS 1024
 #define MAX_CLIENT_OUTPUT (1024U * 1024U)
 
 enum source_kind {
@@ -150,7 +150,8 @@ static int epoll_fd = -1;
 static struct listener *listeners;
 static struct tcp_client *clients;
 static struct upstream_session *sessions;
-static struct query *query_buckets[QUERY_BUCKETS];
+static struct query **query_buckets;
+static size_t query_bucket_count;
 static struct list_node query_deadlines;
 static size_t query_count;
 static u16 last_qid;
@@ -297,7 +298,26 @@ static void client_write(struct tcp_client *client) {
 }
 
 static size_t query_bucket(u16 qid) {
-    return qid & (QUERY_BUCKETS - 1);
+    return qid & (query_bucket_count - 1);
+}
+
+static void query_grow(void) {
+    if (query_count < query_bucket_count * 2 || query_bucket_count >= 32768) return;
+    size_t new_count = query_bucket_count * 2;
+    struct query **new_buckets = xcalloc(new_count, sizeof(*new_buckets));
+    for (size_t i = 0; i < query_bucket_count; ++i) {
+        struct query *q = query_buckets[i];
+        while (q) {
+            struct query *next = q->hash_next;
+            size_t idx = q->qid & (new_count - 1);
+            q->hash_next = new_buckets[idx];
+            new_buckets[idx] = q;
+            q = next;
+        }
+    }
+    free(query_buckets);
+    query_buckets = new_buckets;
+    query_bucket_count = new_count;
 }
 
 static struct query *query_find(u16 qid) {
@@ -336,6 +356,7 @@ static struct query *query_new(struct message *msg, int qnamelen, u16 qtype,
         if (!query_find(qid)) { found = true; break; }
     }
     if (!found) return NULL;
+    query_grow();
     struct query *q = xcalloc(1, sizeof(*q));
     q->request_time = now_msec();
     q->qid = qid;
@@ -1296,6 +1317,8 @@ static void tls_init(void) {
 
 void server_init(void) {
     list_init(&query_deadlines);
+    query_bucket_count = QUERY_INITIAL_BUCKETS;
+    query_buckets = xcalloc(query_bucket_count, sizeof(*query_buckets));
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
         log_error("epoll_create1 failed: (%d) %s", errno, strerror(errno));
