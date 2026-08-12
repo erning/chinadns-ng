@@ -282,6 +282,14 @@ def answer_ip(message):
     return str(ipaddress.ip_address(data)), rtype
 
 
+def assert_nodata(message):
+    flags = struct.unpack_from("!H", message, 2)[0]
+    answers = struct.unpack_from("!H", message, 6)[0]
+    assert flags & 0x8000
+    assert flags & 0x000F == 0
+    assert answers == 0
+
+
 def check_local(binary):
     server = ChinaDNS(binary, "--default-tag", "chn", "--dns-rr-ip", "test.local=192.0.2.1,2001:db8::1")
     try:
@@ -365,6 +373,32 @@ def check_config_and_groups(binary):
         server = ChinaDNS(binary, "--config", config)
         try:
             assert answer_ip(server.query("config.local"))[0] == "192.0.2.88"
+        finally:
+            server.close()
+
+        server = ChinaDNS(
+            binary,
+            "--group", "null",
+            "--default-tag", "null",
+            "--dns-rr-ip", "allowed.local=192.0.2.90",
+        )
+        try:
+            assert answer_ip(server.query("allowed.local"))[0] == "192.0.2.90"
+            assert_nodata(server.query("blocked.example"))
+        finally:
+            server.close()
+
+        blocked = os.path.join(directory, "blocked.txt")
+        with open(blocked, "w", encoding="utf-8") as file:
+            file.write("blocked.example\n")
+        server = ChinaDNS(
+            binary,
+            "--default-tag", "chn",
+            "--group", "null",
+            "--group-dnl", blocked,
+        )
+        try:
+            assert_nodata(server.query("blocked.example"))
         finally:
             server.close()
 

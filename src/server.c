@@ -867,7 +867,7 @@ static void handle_query(struct message *msg, enum query_from from,
         return;
     }
 
-    if (tag > TAG_NONE) {
+    if (tag_is_null(tag)) {
         msg->len = dns_empty_reply(msg->data, qnamelen);
         send_immediate(msg, qnamelen, original_id, bufsz, from, udp_listener, peer, tcp_client);
         return;
@@ -1252,6 +1252,7 @@ void server_init(void) {
 #endif
     for (u8 tag = 0; tag <= TAG_NONE; ++tag) {
         struct group_config *group = &g_config.groups[tag];
+        if (tag_is_null(tag)) continue;
         if (group->ip6.china_ip != group->ip6.non_china_ip) need_ip_test = true;
         if (tag != TAG_NONE && group->ipset_name46 && *group->ipset_name46) {
             ip_addctx[tag] = ipset_new_addctx(group->ipset_name46);

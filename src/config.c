@@ -240,8 +240,12 @@ static void require_group(const char *value) {
 }
 
 static void opt_group_dnl(const char *value) { require_group(value); split_push(&g_config.groups[current_group].dnl_files, value); }
-static void opt_group_upstream(const char *value) { require_group(value); add_upstreams(current_group, value); }
-static void opt_group_ipset(const char *value) { require_group(value); set_group_ipset(current_group, value); }
+static void require_forward_group(const char *value) {
+    require_group(value);
+    if (tag_is_null(current_group)) fail("option is invalid for null group", value);
+}
+static void opt_group_upstream(const char *value) { require_forward_group(value); add_upstreams(current_group, value); }
+static void opt_group_ipset(const char *value) { require_forward_group(value); set_group_ipset(current_group, value); }
 
 static void add_ip6_rule(struct ip6_filter *filter, const char *rule) {
     if (!rule) {
@@ -429,7 +433,7 @@ static void finalize(void) {
         if (!tag_is_valid(tag)) continue;
         if (tag != g_config.default_tag && !g_config.groups[tag].dnl_files.len)
             fail("user group has no domain list", tag_to_name(tag));
-        if (!g_config.groups[tag].upstreams.len)
+        if (!tag_is_null(tag) && !g_config.groups[tag].upstreams.len)
             fail("user group has no upstream", tag_to_name(tag));
     }
 }

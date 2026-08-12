@@ -14,6 +14,7 @@
 u8 tag_register(const char *noalias name, bool *noalias p_overflow);
 
 bool tag_is_valid(u8 tag);
+bool tag_is_null(u8 tag);
 
 /* "gfw", "chn", "none", "<user-defined>", "(null)" */
 const char *tag_to_name(u8 tag);

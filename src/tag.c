@@ -48,6 +48,10 @@ bool tag_is_valid(u8 tag) {
     return tag < array_n(s_tag_to_name) && s_tag_to_name[tag];
 }
 
+bool tag_is_null(u8 tag) {
+    return tag_is_valid(tag) && strcmp(s_tag_to_name[tag], "null") == 0;
+}
+
 const char *tag_to_name(u8 tag) {
     if (tag < array_n(s_tag_to_name))
         return s_tag_to_name[tag] ?: "(null)";
