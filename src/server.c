@@ -1342,7 +1342,7 @@ void server_init(void) {
         for (size_t i = 0; i < group->upstreams.len; ++i) {
 #ifndef ENABLE_WOLFSSL
             if (group->upstreams.items[i].proto == UP_TLS) {
-                log_error("DoT upstream is not enabled in the current C migration milestone: %s",
+                log_error("TLS upstream %s requires a build with WOLFSSL=1",
                     group->upstreams.items[i].url);
                 exit(2);
             }
