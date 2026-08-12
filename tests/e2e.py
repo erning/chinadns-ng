@@ -226,9 +226,10 @@ class ChinaDNS:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+        output = self.process.stdout.read()
         if self.process.returncode != 0:
-            output = self.process.stdout.read()
             raise RuntimeError(f"chinadns-ng exited with {self.process.returncode}:\n{output}")
+        return output
 
     def query(self, name, qtype=1, tcp=False, ident=0x1234):
         query = make_query(name, qtype, ident)
@@ -380,6 +381,24 @@ def check_cache(binary):
     finally:
         server.close()
         mock.close()
+
+    with tempfile.TemporaryDirectory() as directory:
+        cache_db = os.path.join(directory, "invalid-cache.db")
+        header = struct.pack(
+            "=qIiiHBx",
+            int(time.time()), 0, 60, 12, 17, 200,
+        )
+        with open(cache_db, "wb") as file:
+            file.write(header)
+            file.write(bytes(17))
+        server = ChinaDNS(
+            binary,
+            "--default-tag", "chn",
+            "--cache", "8",
+            "--cache-db", cache_db,
+        )
+        output = server.close()
+        assert f"0 entries from {cache_db}" in output, output
 
 
 def check_config_and_groups(binary):

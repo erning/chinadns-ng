@@ -194,7 +194,13 @@ static void cache_load(void) {
     while (cache_count < g_config.cache_size) {
         struct cache_db_header h;
         if (fread(&h, sizeof(h), 1, file) != 1) break;
-        if (h.msg_len < DNS_MSG_MINSIZE || h.qnamelen < DNS_NAME_WIRE_MINLEN) break;
+        size_t question_end = dns_header_len() + question_len(h.qnamelen);
+        if (h.msg_len < DNS_MSG_MINSIZE ||
+            h.qnamelen < DNS_NAME_WIRE_MINLEN ||
+            question_end > h.msg_len) {
+            log_warning("invalid entry in cache db %s", g_config.cache_db);
+            break;
+        }
         struct cache_entry *e = xmalloc(sizeof(*e) + h.msg_len);
         if (fread(e->msg, h.msg_len, 1, file) != 1) { free(e); break; }
         e->update_time = (time_t)h.update_time;
