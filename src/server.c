@@ -661,18 +661,22 @@ static void tcp_session_write(struct upstream_session *s) {
     if (s->u.tcp.state != TCP_READY) return;
     for (struct tcp_request *req = s->u.tcp.head; req; req = req->next) {
         if (req->sent) continue;
-        ssize_t n = tcp_write_data(s, req->frame + req->offset, req->frame_len - req->offset);
+        ssize_t n;
+        do {
+            n = tcp_write_data(s, req->frame + req->offset, req->frame_len - req->offset);
+        } while (n == -1 && errno == EINTR);
         if (n > 0) {
             req->offset += (size_t)n;
             if (req->offset == req->frame_len) req->sent = true;
             else return;
-        } else if (n < 0 && errno == EINTR) {
-            continue;
+        } else if (n == -2) {
+            tcp_disconnect(s, true);
+            return;
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             tcp_update_events(s);
             return;
         } else {
-            if (n != -2) log_warning("send(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
+            log_warning("send(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
             tcp_disconnect(s, true);
             return;
         }
@@ -708,10 +712,11 @@ static bool tcp_read_bytes(struct upstream_session *s, void *buf, size_t *have, 
         ssize_t n = tcp_read_data(s, (u8 *)buf + *have, need - *have);
         if (n > 0) *have += (size_t)n;
         else if (n == 0) { tcp_disconnect(s, true); return false; }
+        else if (n == -2) { tcp_disconnect(s, true); return false; }
         else if (errno == EINTR) continue;
         else if (errno == EAGAIN || errno == EWOULDBLOCK) { tcp_update_events(s); return false; }
         else {
-            if (n != -2) log_warning("recv(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
+            log_warning("recv(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
             tcp_disconnect(s, true);
             return false;
         }
