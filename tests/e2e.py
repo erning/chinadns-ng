@@ -289,6 +289,9 @@ class ChinaDNS:
             for ident in range(count):
                 query = make_query(f"pending-{ident}.example", 1, ident & 0xFFFF)
                 sock.sendto(query, ("127.0.0.1", self.port))
+                if (ident + 1) % 128 == 0:
+                    time.sleep(0.002)
+            time.sleep(0.02)
             query = make_query(final_name, 1, 0x7777)
             sock.sendto(query, ("127.0.0.1", self.port))
             return sock.recv(4096)
