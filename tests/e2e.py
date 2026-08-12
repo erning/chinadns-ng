@@ -316,6 +316,18 @@ def check_local(binary):
     finally:
         server.close()
 
+    with tempfile.TemporaryDirectory() as directory:
+        hosts = os.path.join(directory, "large-hosts")
+        with open(hosts, "w", encoding="utf-8") as file:
+            for value in range(4096):
+                address = f"10.0.{value >> 8}.{value & 0xFF}"
+                file.write(f"{address} huge.local\n")
+        try:
+            ChinaDNS(binary, "--hosts", hosts, "--default-tag", "chn")
+            raise AssertionError("oversized local RR set unexpectedly started")
+        except RuntimeError as error:
+            assert "too many local A records for huge.local" in str(error), error
+
 
 def check_raw_upstream(binary):
     mock = MockDNS("203.0.113.7")

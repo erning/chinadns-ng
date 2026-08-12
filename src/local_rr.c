@@ -88,6 +88,11 @@ static bool add_ip(const char *ascii_name, const char *ip) {
     if (record_exists(*records, *records_len, net_ip, ip_len)) return true;
 
     size_t rr_len = sizeof(struct rr_head) + ip_len;
+    size_t reply_len = dns_header_len() + dns_question_len((int)wire_len) + *records_len + rr_len;
+    if (reply_len > DNS_MSG_MAXSIZE) {
+        log_error("too many local %s records for %s", family == AF_INET ? "A" : "AAAA", ascii_name);
+        return false;
+    }
     *records = xrealloc(*records, *records_len + rr_len);
     struct rr_head *rr = (struct rr_head *)(*records + *records_len);
     rr->name = htons(0xc000u + dns_header_len());

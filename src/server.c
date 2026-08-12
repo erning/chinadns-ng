@@ -865,6 +865,12 @@ static void handle_query(struct message *msg, enum query_from from,
     u16 answer_count;
     if (local_rr_find(msg->data, qnamelen, &answer, &answer_len, &answer_count)) {
         struct message *reply = message_new(dns_header_len() + dns_question_len(qnamelen) + answer_len);
+        if (!reply) {
+            log_warning("local reply for %s exceeds the DNS message size limit", ascii);
+            msg->len = dns_empty_reply(msg->data, qnamelen);
+            send_immediate(msg, qnamelen, original_id, bufsz, from, udp_listener, peer, tcp_client);
+            return;
+        }
         reply->len = reply->cap;
         dns_make_reply(reply->data, msg->data, qnamelen, answer, answer_len, answer_count);
         send_immediate(reply, qnamelen, original_id, bufsz, from, udp_listener, peer, tcp_client);
