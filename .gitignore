@@ -8,3 +8,4 @@ dep/mimalloc-*
 dep/wolfssl-*
 tool/dns_cache_mgr
 tool/*.db
+build*/

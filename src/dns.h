@@ -101,7 +101,7 @@ void dns_update_ttl(void *noalias msg, ssize_t len, int qnamelen, i32 ttl_change
 /*
 * `levels`: the level of the domain to get (8 bools)
 * `domains[8]`: store the domain names
-* `p_domain_end`: store the domain end ptr 
+* `p_domain_end`: store the domain end ptr
 * `return`: the number of domains (-1 means error)
 */
 int dns_qname_domains(const void *noalias msg, int qnamelen, u8 interest_levels,

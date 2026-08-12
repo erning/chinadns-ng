@@ -438,10 +438,12 @@ static bool load_list(u8 tag, filenames_t filenames,
             }
         }
 
-        if (fp == stdin)
-            (void)freopen("/dev/null", "rb", stdin);
-        else
+        if (fp == stdin) {
+            FILE *ignored_stdin = freopen("/dev/null", "rb", stdin);
+            (void)ignored_stdin;
+        } else {
             fclose(fp);
+        }
     }
 
     if (count > 0) {
@@ -540,7 +542,7 @@ void dnl_init(const filenames_t tag_to_filenames[TAG__MAX + 1], bool gfwlist_fir
     log_info("L1 items:%lu lists:%lu buckets:%lu cost:%.3fk",
         (ulong)s_map1.nitems, (ulong)s_map1.nlists, (ulong)map_cap(&s_map1), map_cap(&s_map1)*sizeof(struct bucket)/1024.0);
 
-    if (!map_is_null(&s_map2)) 
+    if (!map_is_null(&s_map2))
         log_info("L2 items:%lu lists:%lu buckets:%lu cost:%.3fk",
             (ulong)s_map2.nitems, (ulong)s_map2.nlists, (ulong)map_cap(&s_map2), map_cap(&s_map2)*sizeof(struct bucket)/1024.0);
 

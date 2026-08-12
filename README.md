@@ -48,26 +48,20 @@
 
 ---
 
-**zig 工具链**
+**C 工具链**
 
-- 从 2024.03.07 版本起，程序使用 Zig + C 语言编写，`zig` 是唯一需要的工具链。
-- 从 [ziglang.org](https://ziglang.org/download/) 下载 zig 0.10.1，请根据当前（编译）主机的架构来选择合适的版本。
-- 将解压后的目录加入 PATH 环境变量，执行 `zig version`，检查是否有输出 `0.10.1`。
-- 注意，目前必须使用 zig 0.10.1 版本，因为 0.11、master 版本暂时不支持 async 特性。
-
----
-
-如果要构建 DoT 支持，请带上 `-Dwolfssl` 参数，构建过程需要以下依赖：
-- `wget` 或 `curl` 用于下载 wolfssl 源码包；`tar` 用于解压缩
-- `autoconf`、`automake`、`libtool`、`make` 用于构建 wolfssl
-
-针对 x86_64(v3/v4)、aarch64 的 wolfssl 构建已默认启用硬件指令加速，若目标硬件(CPU)不支持相关指令（部分树莓派阉割了 aes 相关指令），请指定 `-Dwolfssl-noasm` 选项，避免运行 chinadns-ng 时出现 SIGILL 非法指令异常。
+- 项目源码使用 GNU C11，仅支持 Linux。运行时使用 `epoll`、`signalfd` 和 Netlink，不再依赖 Zig 语言运行时或 Zig 0.10。
+- 本机编译需要 C 编译器和 `make`，也可使用 CMake。已在 Ubuntu 26.04 的 GCC 15 与 Clang 21 上验证。
+- DoT 为可选功能，需要 wolfSSL 的头文件与库。Debian/Ubuntu 可安装 `libwolfssl-dev`。
+- 交叉编译仍可选择现代 Zig 的 `zig cc`，它只作为 C 交叉编译器使用，不限制项目源码语言和构建系统版本。
 
 ---
 
-如果遇到编译错误，请先执行 `zig build clean-all`，然后重新执行相关构建命令。
+使用 Make 构建 DoT 版本时指定 `WOLFSSL=1`，产物为 `build/chinadns-ng+wolfssl`；使用 CMake 时指定 `-DENABLE_WOLFSSL=ON`。证书验证仍由 `--cert-verify` 和 `--ca-certs` 控制。
 
-可执行文件在 `./zig-out/bin` 目录，将文件安装（复制）到目标主机 PATH 路径下即可。
+---
+
+Make 默认将可执行文件写入 `build/chinadns-ng`。CMake 的输出目录由 `-B` 参数决定。
 
 ---
 
@@ -75,68 +69,33 @@
 git clone https://github.com/zfl9/chinadns-ng
 cd chinadns-ng
 
-# 本机 (若构建失败，请手动指定"-Dtarget"和"-Dcpu")
-zig build # 链接到glibc
-zig build -Dtarget=native-native-musl # 静态链接到musl
+# Make：本机动态链接构建
+make -j
 
-# x86
-zig build -Dtarget=i386-linux-musl -Dcpu=i686
-zig build -Dtarget=i386-linux-musl -Dcpu=pentium4
+# Make：启用 DoT
+make -j WOLFSSL=1
 
-# x86_64
-zig build -Dtarget=x86_64-linux-musl -Dcpu=x86_64 # v1
-zig build -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v2
-zig build -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3
-zig build -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v4
+# CMake
+cmake -S . -B build-cmake
+cmake --build build-cmake -j
 
-# arm
-zig build -Dtarget=arm-linux-musleabi -Dcpu=generic+v5t+soft_float
-zig build -Dtarget=arm-linux-musleabi -Dcpu=generic+v5te+soft_float
-zig build -Dtarget=arm-linux-musleabi -Dcpu=generic+v6+soft_float
-zig build -Dtarget=arm-linux-musleabi -Dcpu=generic+v6t2+soft_float
-zig build -Dtarget=arm-linux-musleabi -Dcpu=generic+v7a # soft_float
-zig build -Dtarget=arm-linux-musleabihf -Dcpu=generic+v7a # hard_float
+# 测试（需要 Linux 和 Python 3）
+make check
 
-# aarch64
-zig build -Dtarget=aarch64-linux-musl -Dcpu=generic+v8a
-zig build -Dtarget=aarch64-linux-musl -Dcpu=generic+v9a
+# DoT 与证书校验测试（需要 wolfSSL、OpenSSL 和 Python 3）
+make check-wolfssl
 
-# mips + soft_float
-# 请先阅读 https://www.zfl9.com/zig-mips.html
-ARCH=mips32 && MIPS_M_ARCH=$ARCH MIPS_SOFT_FP=1 zig build -Dtarget=mips-linux-musl -Dcpu=$ARCH+soft_float
-ARCH=mips32r2 && MIPS_M_ARCH=$ARCH MIPS_SOFT_FP=1 zig build -Dtarget=mips-linux-musl -Dcpu=$ARCH+soft_float
-ARCH=mips32r3 && MIPS_M_ARCH=$ARCH MIPS_SOFT_FP=1 zig build -Dtarget=mips-linux-musl -Dcpu=$ARCH+soft_float
-ARCH=mips32r5 && MIPS_M_ARCH=$ARCH MIPS_SOFT_FP=1 zig build -Dtarget=mips-linux-musl -Dcpu=$ARCH+soft_float
+# ipset 裁决与 add-IP 测试（需要 root 权限和 ipset）
+sudo make check-ipset
 
-# mipsel + soft_float
-# 请先阅读 https://www.zfl9.com/zig-mips.html
-ARCH=mips32 && MIPS_M_ARCH=$ARCH MIPS_SOFT_FP=1 zig build -Dtarget=mipsel-linux-musl -Dcpu=$ARCH+soft_float
-ARCH=mips32r2 && MIPS_M_ARCH=$ARCH MIPS_SOFT_FP=1 zig build -Dtarget=mipsel-linux-musl -Dcpu=$ARCH+soft_float
-ARCH=mips32r3 && MIPS_M_ARCH=$ARCH MIPS_SOFT_FP=1 zig build -Dtarget=mipsel-linux-musl -Dcpu=$ARCH+soft_float
-ARCH=mips32r5 && MIPS_M_ARCH=$ARCH MIPS_SOFT_FP=1 zig build -Dtarget=mipsel-linux-musl -Dcpu=$ARCH+soft_float
+# 使用现代 zig cc 生成静态 musl 多架构产物
+./tool/cross-build.sh
 
-# mips + hard_float
-# 请先阅读 https://www.zfl9.com/zig-mips.html
-ARCH=mips32 && MIPS_M_ARCH=$ARCH zig build -Dtarget=mips-linux-musl -Dcpu=$ARCH
-ARCH=mips32r2 && MIPS_M_ARCH=$ARCH zig build -Dtarget=mips-linux-musl -Dcpu=$ARCH
-ARCH=mips32r3 && MIPS_M_ARCH=$ARCH zig build -Dtarget=mips-linux-musl -Dcpu=$ARCH
-ARCH=mips32r5 && MIPS_M_ARCH=$ARCH zig build -Dtarget=mips-linux-musl -Dcpu=$ARCH
-
-# mipsel + hard_float
-# 请先阅读 https://www.zfl9.com/zig-mips.html
-ARCH=mips32 && MIPS_M_ARCH=$ARCH zig build -Dtarget=mipsel-linux-musl -Dcpu=$ARCH
-ARCH=mips32r2 && MIPS_M_ARCH=$ARCH zig build -Dtarget=mipsel-linux-musl -Dcpu=$ARCH
-ARCH=mips32r3 && MIPS_M_ARCH=$ARCH zig build -Dtarget=mipsel-linux-musl -Dcpu=$ARCH
-ARCH=mips32r5 && MIPS_M_ARCH=$ARCH zig build -Dtarget=mipsel-linux-musl -Dcpu=$ARCH
-
-# mips64/mips64el 请前往 releases 页面下载预编译的可执行文件
-# 如果想自己编译，请先前往 zig 根目录，按顺序 apply 这两个补丁
-# - https://github.com/ziglang/zig/pull/14541.patch
-# - https://github.com/ziglang/zig/pull/14556.patch
-
-# riscv64
-zig build -Dtarget=riscv64-linux-musl
+# 也可只构建指定目标
+./tool/cross-build.sh x86_64-linux-musl mipsel-linux-musleabi
 ```
+
+交叉编译脚本默认覆盖 x86、x86_64、ARM soft-float/hard-float、AArch64、MIPS/MIPSel soft-float/hard-float、MIPS64/MIPS64el 和 RISC-V 64。产物位于 `build/cross/`。
 
 </p></details>
 

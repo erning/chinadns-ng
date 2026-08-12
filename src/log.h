@@ -2,12 +2,15 @@
 
 #include <stdio.h>
 #include <time.h>
+#include <stdbool.h>
 
 #ifndef LOG_FILENAME
 #define LOG_FILENAME __FILE__
 #endif
 
 const struct tm *get_tm(void);
+
+extern bool log_verbose_enabled;
 
 #define log_write(color, level, fmt, args...) ({ \
     const struct tm *tm_ = get_tm(); \
@@ -26,3 +29,8 @@ const struct tm *get_tm(void);
 
 #define log_error(fmt, args...) \
     log_write("35", "E", fmt, ##args)
+
+#define log_verbose(fmt, args...) ({ \
+    if (log_verbose_enabled) \
+        log_write("36", "D", fmt, ##args); \
+})
