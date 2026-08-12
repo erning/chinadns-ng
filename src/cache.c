@@ -32,7 +32,10 @@ struct cache_db_header {
     i32 refresh_ttl;
     u16 msg_len;
     u8 qnamelen;
+    u8 reserved;
 };
+
+STATIC_ASSERT(sizeof(struct cache_db_header) == 24);
 
 struct ignored_domain {
     struct ignored_domain *next;

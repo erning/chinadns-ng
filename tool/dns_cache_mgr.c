@@ -15,8 +15,11 @@ struct header {
     i32 ttl_r;
     u16 msg_len;
     u8 qnamelen;
+    u8 reserved;
     // msg: [msg_len]u8, // {header, question, answer, authority, additional}
 };
+
+STATIC_ASSERT(sizeof(struct header) == 24);
 
 #define alignto(n) __attribute__((aligned(n)))
 #define printf_exit(msg, args...) ({ fprintf(stderr, msg "\n", ##args); exit(1); })
