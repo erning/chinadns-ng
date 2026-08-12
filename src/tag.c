@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "tag.h"
+#include "core.h"
 #include <stddef.h>
 #include <string.h>
 
@@ -31,7 +31,7 @@ u8 tag_register(const char *noalias name, bool *noalias p_overflow) {
     /* alloc new tag value */
     for (u8 tag = TAG__USER; tag <= TAG__MAX; ++tag) {
         if (!s_tag_to_name[tag]) {
-            s_tag_to_name[tag] = strdup(name);
+            s_tag_to_name[tag] = xstrdup(name);
             return tag;
         }
     }
