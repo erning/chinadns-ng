@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/types.h>
-#include <signal.h>
 
 #define likely(x)	__builtin_expect(!!(x), 1)
 #define unlikely(x)	__builtin_expect(!!(x), 0)
@@ -123,17 +122,8 @@ typedef u8 bitvec_t;
 
 /* ======================================================== */
 
-void sig_register(int sig, sighandler_t handler);
-
-const void *SIG_IGNORE(void);
-const void *SIG_DEFAULT(void);
-
 bool is_dir(const char *path);
-
-ssize_t fstat_size(int fd);
 
 uint calc_hashv(const void *ptr, size_t len);
 
 bool has_aes(void);
-
-u64 monotime(void);

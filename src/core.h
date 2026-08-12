@@ -23,7 +23,6 @@ char *xstrndup(const char *str, size_t len);
 
 void strvec_push(struct strvec *vec, const char *str);
 void strvec_push_n(struct strvec *vec, const char *str, size_t len);
-bool strvec_contains(const struct strvec *vec, const char *str);
 
 struct socket_addr {
     struct sockaddr_storage storage;
@@ -32,7 +31,6 @@ struct socket_addr {
 
 bool socket_addr_parse(struct socket_addr *addr, const char *ip, u16 port);
 int socket_addr_family(const struct socket_addr *addr);
-void socket_addr_text(const struct socket_addr *addr, char *ip, size_t ip_size, u16 *port);
 
 int set_nonblocking(int fd);
 int set_cloexec(int fd);

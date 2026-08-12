@@ -7,7 +7,6 @@
 #include <assert.h>
 #include <unistd.h>
 #include <sys/syscall.h>
-#include <sys/epoll.h>
 
 /* ipv4/ipv6 address length (binary) */
 #define IPV4_LEN 4  /* 4byte, 32bit */
@@ -53,12 +52,6 @@ extern int (*RECVMMSG)(int sockfd, MMSGHDR *msgvec, unsigned int vlen, int flags
 extern int (*SENDMMSG)(int sockfd, MMSGHDR *msgvec, unsigned int vlen, int flags);
 
 void net_init(void);
-
-u32 epev_get_events(const void *noalias ev);
-void *epev_get_ptrdata(const void *noalias ev);
-
-void epev_set_events(void *noalias ev, u32 events);
-void epev_set_ptrdata(void *noalias ev, const void *ptrdata);
 
 #define set_iov(iov, buf, sz) ({ \
     (iov)->iov_base = (buf); \

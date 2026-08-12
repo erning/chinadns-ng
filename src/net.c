@@ -99,19 +99,3 @@ void net_init(void) {
         SENDMMSG = userspace_sendmmsg;
     }
 }
-
-u32 epev_get_events(const void *noalias ev) {
-    return cast(const struct epoll_event *, ev)->events;
-}
-
-void *epev_get_ptrdata(const void *noalias ev) {
-    return cast(const struct epoll_event *, ev)->data.ptr;
-}
-
-void epev_set_events(void *noalias ev, u32 events) {
-    cast(struct epoll_event *, ev)->events = events;
-}
-
-void epev_set_ptrdata(void *noalias ev, const void *ptrdata) {
-    cast(struct epoll_event *, ev)->data.ptr = (void *)ptrdata;
-}

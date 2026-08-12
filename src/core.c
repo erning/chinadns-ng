@@ -61,13 +61,6 @@ void strvec_push(struct strvec *vec, const char *str) {
     strvec_push_n(vec, str, strlen(str));
 }
 
-bool strvec_contains(const struct strvec *vec, const char *str) {
-    for (size_t i = 0; i < vec->len; ++i)
-        if (strcmp(vec->items[i], str) == 0)
-            return true;
-    return false;
-}
-
 bool socket_addr_parse(struct socket_addr *addr, const char *ip, u16 port) {
     memset(addr, 0, sizeof(*addr));
 
@@ -92,21 +85,6 @@ bool socket_addr_parse(struct socket_addr *addr, const char *ip, u16 port) {
 
 int socket_addr_family(const struct socket_addr *addr) {
     return addr->storage.ss_family;
-}
-
-void socket_addr_text(const struct socket_addr *addr, char *ip, size_t ip_size, u16 *port) {
-    const void *src;
-    if (addr->storage.ss_family == AF_INET) {
-        const struct sockaddr_in *v4 = (const struct sockaddr_in *)&addr->storage;
-        src = &v4->sin_addr;
-        *port = ntohs(v4->sin_port);
-    } else {
-        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)&addr->storage;
-        src = &v6->sin6_addr;
-        *port = ntohs(v6->sin6_port);
-    }
-    if (!inet_ntop(addr->storage.ss_family, src, ip, ip_size))
-        snprintf(ip, ip_size, "?");
 }
 
 int set_nonblocking(int fd) {
