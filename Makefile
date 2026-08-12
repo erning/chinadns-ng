@@ -40,14 +40,41 @@ SOURCES := \
 
 OBJECT_DIR := build/obj/$(BUILD_VARIANT)
 OBJECTS := $(SOURCES:src/%.c=$(OBJECT_DIR)/%.o)
+BUILD_CONFIG := $(OBJECT_DIR)/.build-config
 
-.PHONY: all clean check check-wolfssl check-ipset
+define BUILD_CONFIG_CONTENT
+CC=$(CC)
+CPPFLAGS=$(CPPFLAGS)
+PROJECT_CPPFLAGS=$(PROJECT_CPPFLAGS)
+CFLAGS=$(CFLAGS)
+PROJECT_CFLAGS=$(PROJECT_CFLAGS)
+LDFLAGS=$(LDFLAGS)
+PROJECT_LDLIBS=$(PROJECT_LDLIBS)
+LDLIBS=$(LDLIBS)
+endef
+
+.PHONY: all clean check check-wolfssl check-ipset FORCE
 
 all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
 	@mkdir -p $(@D)
 	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(PROJECT_LDLIBS) $(LDLIBS)
+
+$(OBJECT_DIR):
+	@mkdir -p $@
+
+$(BUILD_CONFIG): FORCE | $(OBJECT_DIR)
+	$(file >$@.tmp,$(BUILD_CONFIG_CONTENT))
+	@if cmp -s "$@.tmp" "$@"; then \
+		rm -f "$@.tmp"; \
+	else \
+		mv -f "$@.tmp" "$@"; \
+	fi
+
+FORCE:
+
+$(OBJECTS): $(BUILD_CONFIG)
 
 $(OBJECT_DIR)/%.o: src/%.c
 	@mkdir -p $(@D)
