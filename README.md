@@ -344,7 +344,9 @@ bug report: https://github.com/zfl9/chinadns-ng. email: zfl9.com@gmail.com (Otok
     - `--bind-port 65353`：监听 UDP 和 TCP（默认）。
     - `--bind-port 65353@udp`：只监听 UDP。
     - `--bind-port 65353@tcp`：只监听 TCP。
-  - 2024.07.16 版本起，`bind-port` 允许指定多次，以便监听多个不同的 port。
+  - 2024.07.16 版本起，`bind-port` 允许指定多次，以便监听多个不同的端口。
+    - 同一端口重复指定时，以最后一次指定的协议为准。如需同时监听 UDP 和 TCP，
+      请只指定一次且不要添加协议后缀，例如 `--bind-port 65353`。
 
 ### china-dns、trust-dns
 
