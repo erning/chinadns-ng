@@ -33,6 +33,9 @@ target_compile_options(chinadns-ng PRIVATE
 
 if(ENABLE_WOLFSSL)
     target_compile_definitions(chinadns-ng PRIVATE ENABLE_WOLFSSL)
-    find_library(WOLFSSL_LIBRARY wolfssl REQUIRED)
+    find_library(WOLFSSL_LIBRARY wolfssl)
+    if(NOT WOLFSSL_LIBRARY)
+        message(FATAL_ERROR "wolfSSL library not found")
+    endif()
     target_link_libraries(chinadns-ng PRIVATE ${WOLFSSL_LIBRARY})
 endif()
