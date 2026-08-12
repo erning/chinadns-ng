@@ -4,16 +4,17 @@ CFLAGS ?= -O2 -g
 LDFLAGS ?=
 LDLIBS ?=
 
-CPPFLAGS += -Isrc
-CFLAGS += -std=gnu11 -Wall -Wextra -fno-strict-aliasing
+PROJECT_CPPFLAGS := -Isrc
+PROJECT_CFLAGS := -std=gnu11 -Wall -Wextra -fno-strict-aliasing
+PROJECT_LDLIBS :=
 
 ifeq ($(MUSL),1)
-CPPFLAGS += -DMUSL
+PROJECT_CPPFLAGS += -DMUSL
 endif
 
 ifeq ($(WOLFSSL),1)
-CPPFLAGS += -DENABLE_WOLFSSL
-LDLIBS += -lwolfssl
+PROJECT_CPPFLAGS += -DENABLE_WOLFSSL
+PROJECT_LDLIBS += -lwolfssl
 BUILD_VARIANT := wolfssl
 TARGET ?= build/chinadns-ng+wolfssl
 else
@@ -46,11 +47,11 @@ all: $(TARGET)
 
 $(TARGET): $(OBJECTS)
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(PROJECT_LDLIBS) $(LDLIBS)
 
 $(OBJECT_DIR)/%.o: src/%.c
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(PROJECT_CFLAGS) -MMD -MP -c -o $@ $<
 
 check: $(TARGET)
 	python3 tests/e2e.py $(TARGET)
