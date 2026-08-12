@@ -533,6 +533,22 @@ def check_config_and_groups(binary):
         finally:
             server.close()
 
+        mock = MockDNS("192.0.2.91")
+        mock.start()
+        server = ChinaDNS(
+            binary,
+            "--default-tag", "chn",
+            "--china-dns", f"udp://127.0.0.1#{mock.port}?count=0?life=0",
+            "--filter-qtype", "1,1,65535",
+        )
+        try:
+            assert_nodata(server.query("filtered-a.example"))
+            assert_nodata(server.query("filtered-max.example", qtype=65535))
+            assert mock.counts == {"udp": 0, "tcp": 0}, mock.counts
+        finally:
+            server.close()
+            mock.close()
+
 
 def check_rotation_and_timeout(binary):
     rotating = MockDNS("192.0.2.66")

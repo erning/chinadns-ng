@@ -282,15 +282,13 @@ static void opt_no_ipv6(const char *value) {
 }
 
 static void opt_filter_qtype(const char *value) {
+    if (!g_config.filter_qtypes)
+        g_config.filter_qtypes = xcalloc(bitvec_n((size_t)UINT16_MAX + 1), sizeof(*g_config.filter_qtypes));
     char *work = xstrdup(value);
     char *save = NULL;
     for (char *p = strtok_r(work, ",", &save); p; p = strtok_r(NULL, ",", &save)) {
         u16 qtype = (u16)parse_uint(p, UINT16_MAX, true);
-        if (!config_qtype_filtered(qtype)) {
-            size_t n = ++g_config.filter_qtypes_len;
-            g_config.filter_qtypes = xrealloc(g_config.filter_qtypes, n * sizeof(*g_config.filter_qtypes));
-            g_config.filter_qtypes[n - 1] = qtype;
-        }
+        bitvec_set1(g_config.filter_qtypes, qtype);
     }
     free(work);
 }
@@ -470,9 +468,7 @@ void config_parse(int argc, char **argv) {
 }
 
 bool config_qtype_filtered(u16 qtype) {
-    for (size_t i = 0; i < g_config.filter_qtypes_len; ++i)
-        if (g_config.filter_qtypes[i] == qtype) return true;
-    return false;
+    return g_config.filter_qtypes && bitvec_get(g_config.filter_qtypes, qtype);
 }
 
 bool config_ip6_filter_query(u8 tag) {

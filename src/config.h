@@ -71,8 +71,7 @@ struct config {
     char *chnroute6_name;
     char *ca_certs;
 
-    u16 *filter_qtypes;
-    size_t filter_qtypes_len;
+    bitvec_t *filter_qtypes;
 
     u16 cache_size;
     u32 cache_stale;
