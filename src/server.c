@@ -1325,19 +1325,18 @@ void server_run(void) {
                     break;
                 case SOURCE_UPSTREAM_TCP: {
                     struct upstream_session *s = container_of(source, struct upstream_session, source);
-                    if (flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) tcp_disconnect(s, true);
-                    else {
-                        bool write_ready = flags & EPOLLOUT;
-                        bool read_ready = flags & EPOLLIN;
+                    bool terminal = flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP);
+                    bool write_ready = flags & EPOLLOUT;
+                    bool read_ready = flags & EPOLLIN;
 #ifdef ENABLE_WOLFSSL
-                        if (session_is_tls(s) && s->u.tcp.state == TCP_READY) {
-                            if (s->u.tcp.tls_write_want && (flags & s->u.tcp.tls_write_want)) write_ready = true;
-                            if (s->u.tcp.tls_read_want && (flags & s->u.tcp.tls_read_want)) read_ready = true;
-                        }
-#endif
-                        if (write_ready) tcp_session_write(s);
-                        if (!source->closed && read_ready) tcp_session_read(s);
+                    if (session_is_tls(s) && s->u.tcp.state == TCP_READY) {
+                        if (s->u.tcp.tls_write_want && (flags & s->u.tcp.tls_write_want)) write_ready = true;
+                        if (s->u.tcp.tls_read_want && (flags & s->u.tcp.tls_read_want)) read_ready = true;
                     }
+#endif
+                    if (write_ready) tcp_session_write(s);
+                    if (!source->closed && read_ready) tcp_session_read(s);
+                    if (!source->closed && terminal) tcp_disconnect(s, true);
                     break;
                 }
                 case SOURCE_SIGNAL:

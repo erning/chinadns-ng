@@ -55,9 +55,10 @@ def recv_exact(sock, size):
 
 
 class MockDNS:
-    def __init__(self, address, drop_first=0):
+    def __init__(self, address, drop_first=0, close_after_reply=False):
         self.address = address
         self.drop_first = drop_first
+        self.close_after_reply = close_after_reply
         self.port = free_port()
         self.stop_event = threading.Event()
         self.counts = {"udp": 0, "tcp": 0}
@@ -121,6 +122,9 @@ class MockDNS:
                     continue
                 answer = make_answer(query, self.address)
                 conn.sendall(struct.pack("!H", len(answer)) + answer)
+                if self.close_after_reply:
+                    conn.shutdown(socket.SHUT_WR)
+                    return
 
 
 class MockDoT:
@@ -339,6 +343,20 @@ def check_explicit_protocols(binary):
     finally:
         tcp_server.close()
         tcp_mock.close()
+
+    closing_tcp_mock = MockDNS("198.51.100.11", close_after_reply=True)
+    closing_tcp_mock.start()
+    closing_tcp_server = ChinaDNS(
+        binary,
+        "--default-tag", "chn",
+        "--china-dns", f"tcp://127.0.0.1#{closing_tcp_mock.port}?count=0?life=0",
+    )
+    try:
+        assert answer_ip(closing_tcp_server.query("tcp-close.example"))[0] == "198.51.100.11"
+        assert closing_tcp_mock.counts == {"udp": 0, "tcp": 1}, closing_tcp_mock.counts
+    finally:
+        closing_tcp_server.close()
+        closing_tcp_mock.close()
 
     udp_mock = MockDNS("198.51.100.10")
     udp_mock.start()
