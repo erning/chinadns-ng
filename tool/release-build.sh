@@ -17,6 +17,15 @@ noasm=${NOASM:-1}
 wolfssl_version=${WOLFSSL_VERSION:-5.8.2}
 jobs=${JOBS:-}
 
+case $out in
+    /*) ;;
+    *) out=$root/$out ;;
+esac
+case $cache in
+    /*) ;;
+    *) cache=$root/$cache ;;
+esac
+
 if [ "$#" -gt 0 ]; then
     targets="$*"
 fi
