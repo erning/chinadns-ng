@@ -97,6 +97,69 @@ sudo make check-ipset
 
 交叉编译脚本默认覆盖 x86、x86_64、ARM soft-float/hard-float、AArch64、MIPS/MIPSel soft-float/hard-float、MIPS64/MIPS64el 和 RISC-V 64。产物位于 `build/cross/`。
 
+也可以使用 Docker 和 Alpine 软件仓库当前提供的 Zig 工具链构建完整的 Release 矩阵。以下命令会生成 47 个静态二进制文件和 `SHA256SUMS`，并将它们直接导出到 `build/docker/`：
+
+```bash
+docker build \
+  --target artifacts \
+  --output type=local,dest=build/docker \
+  .
+```
+
+这里的“23 个目标”指 CPU/ABI 组合，不是最终文件数：
+
+- AArch64：`generic+v8a`、`generic+v9a`；
+- ARM：`v5t`、`v5te`、`v6`、`v6t2` 软浮点，以及 `v7a` 软浮点和硬浮点；
+- x86：i386 的 `i686`、`pentium4`，以及 x86_64 的 v1、v2、v3、v4；
+- MIPS：MIPS32、MIPS32el、MIPS64、MIPS64el 各自的硬浮点和软浮点；
+- RISC-V 64：`baseline_rv64`。
+
+每个组合各生成普通版和 wolfSSL/DoT 版，共 46 个文件；再加上 AArch64 v8a 的 `wolfssl_noasm` 版，总计 47 个。默认使用 wolfSSL 5.8.2，可通过 `WOLFSSL_VERSION` 构建参数覆盖。
+
+Alpine 当前提供的 Zig 0.16 无法为 MIPS64/MIPS64el 软浮点目标完成 LTO 链接，因此这 4 个文件使用 `-O3` 并以 `@fast` 结尾；其余 43 个文件使用 `-O3 -flto` 并以 `@fast+lto` 结尾。构建脚本包含仅对 MIPS 软浮点生效的 Zig/Clang 兼容包装器，最终 ELF 的软浮点 ABI 标志会在构建验证中检查。
+
+通过 `TARGETS` 可以筛选目标。筛选一个架构时会构建该架构的全部 CPU 变体和 flavor：
+
+```bash
+docker build \
+  --target artifacts \
+  --build-arg "TARGETS=x86_64-linux-musl aarch64-linux-musl" \
+  --output type=local,dest=build/docker \
+  .
+```
+
+只需要不含 DoT 的普通版本时，可以指定 `FLAVORS=plain`；如不需要额外的 `wolfssl_noasm` 版本，可以指定 `NOASM=0`：
+
+```bash
+docker build \
+  --target artifacts \
+  --build-arg FLAVORS=plain \
+  --build-arg NOASM=0 \
+  --output type=local,dest=build/docker \
+  .
+```
+
+也可以像使用常规编译工具镜像一样，先构建可复用的工具链镜像，再挂载源码目录。默认构建完整矩阵；镜像名后的参数用于筛选目标：
+
+```bash
+docker build -t chinadns-ng-builder .
+
+# 构建全部目标
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$PWD",dst=/src \
+  chinadns-ng-builder
+
+# 只构建指定目标
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$PWD",dst=/src \
+  chinadns-ng-builder \
+  x86_64-linux-musl aarch64-linux-musl
+```
+
+工具链镜像可在 Linux amd64 或 arm64 环境中构建，生成的目标架构与构建环境架构无关。挂载源码目录时，产物位于宿主机的 `build/release/`，wolfSSL 源码和各目标的中间产物缓存在 `build/.release-cache/`。
+
 </p></details>
 
 ## Docker
