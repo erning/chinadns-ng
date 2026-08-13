@@ -44,129 +44,29 @@
 
 > 请前往 [releases](https://github.com/zfl9/chinadns-ng/releases) 页面下载可执行文件，添加可执行权限，放到 PATH 路径下（如 `/usr/local/bin/`）。
 
-<details><summary><b>点我展开编译说明</b></summary><p>
-
----
-
-**C 工具链**
-
-- 项目源码使用 GNU C11，仅支持 Linux。运行时使用 `epoll`、`signalfd` 和 Netlink，不再依赖 Zig 语言运行时或 Zig 0.10。
-- 本机编译需要 C 编译器和 `make`，也可使用 CMake。已在 Ubuntu 26.04 的 GCC 15 与 Clang 21 上验证。
-- DoT 为可选功能，需要 wolfSSL 的头文件与库。Debian/Ubuntu 可安装 `libwolfssl-dev`。
-- 交叉编译仍可选择现代 Zig 的 `zig cc`，它只作为 C 交叉编译器使用，不限制项目源码语言和构建系统版本。
-
----
-
-使用 Make 构建 DoT 版本时指定 `WOLFSSL=1`，产物为 `build/chinadns-ng+wolfssl`；使用 CMake 时指定 `-DENABLE_WOLFSSL=ON`。证书验证仍由 `--cert-verify` 和 `--ca-certs` 控制。
-
----
-
-Make 默认将可执行文件写入 `build/chinadns-ng`。CMake 的输出目录由 `-B` 参数决定。
-
----
-
 ```bash
 git clone https://github.com/zfl9/chinadns-ng
 cd chinadns-ng
 
-# Make：本机动态链接构建
+# 本机构建
 make -j
 
-# Make：启用 DoT
-make -j WOLFSSL=1
-
-# CMake
-cmake -S . -B build-cmake
-cmake --build build-cmake -j
-
-# 测试（需要 Linux 和 Python 3）
-make check
-
-# DoT 与证书校验测试（需要 wolfSSL、OpenSSL 和 Python 3）
-make check-wolfssl
-
-# ipset 裁决与 add-IP 测试（需要 root 权限和 ipset）
-sudo make check-ipset
-
-# 使用现代 zig cc 生成静态 musl 多架构产物
-./tool/cross-build.sh
-
-# 也可只构建指定目标
-./tool/cross-build.sh x86_64-linux-musl mipsel-linux-musleabi
-```
-
-交叉编译脚本默认覆盖 x86、x86_64、ARM soft-float/hard-float、AArch64、MIPS/MIPSel soft-float/hard-float、MIPS64/MIPS64el 和 RISC-V 64。产物位于 `build/cross/`。
-
-也可以使用 Docker 和 Alpine 软件仓库当前提供的 Zig 工具链构建完整的 Release 矩阵。以下命令会生成 47 个静态二进制文件和 `SHA256SUMS`，并将它们直接导出到 `build/docker/`：
-
-```bash
+# Docker：构建完整的静态 Linux Release 矩阵
 docker build \
   --target artifacts \
   --output type=local,dest=build/docker \
   .
 ```
 
-这里的“23 个目标”指 CPU/ABI 组合，不是最终文件数：
+完整的本机构建、CMake、测试、Zig 交叉编译和 Docker Release 矩阵说明见[《构建指南》](BUILD.md)。该文档列出了全部 23 个 CPU/ABI 组合，以及按架构、CPU 和 wolfSSL 构建变体精确构建的命令。
 
-- AArch64：`generic+v8a`、`generic+v9a`；
-- ARM：`v5t`、`v5te`、`v6`、`v6t2` 软浮点，以及 `v7a` 软浮点和硬浮点；
-- x86：i386 的 `i686`、`pentium4`，以及 x86_64 的 v1、v2、v3、v4；
-- MIPS：MIPS32、MIPS32el、MIPS64、MIPS64el 各自的硬浮点和软浮点；
-- RISC-V 64：`baseline_rv64`。
+## 在 Docker 中运行
 
-每个组合各生成普通版和 wolfSSL/DoT 版，共 46 个文件；再加上 AArch64 v8a 的 `wolfssl_noasm` 版，总计 47 个。默认使用 wolfSSL 5.8.2，可通过 `WOLFSSL_VERSION` 构建参数覆盖。
+本节说明如何运行已编译的 chinadns-ng；如需使用 Docker 编译，请阅读[《构建指南》](BUILD.md)。
 
-Alpine 当前提供的 Zig 0.16 无法为 MIPS64/MIPS64el 软浮点目标完成 LTO 链接，因此这 4 个文件使用 `-O3` 并以 `@fast` 结尾；其余 43 个文件使用 `-O3 -flto` 并以 `@fast+lto` 结尾。构建脚本包含仅对 MIPS 软浮点生效的 Zig/Clang 兼容包装器，最终 ELF 的软浮点 ABI 标志会在构建验证中检查。
+如果需要操作内核中的 ipset/nftset，容器必须使用相应的网络命名空间，并具有 Linux capability `NET_ADMIN`（网络管理能力）。可使用 `--cap-add NET_ADMIN`；如需操作宿主机网络命名空间中的集合，通常还需要 `--network host`。`--privileged` 也可以提供所需权限，但它会赋予容器更广泛的权限。如果不使用 ipset/nftset 功能，则无需上述网络管理权限。
 
-通过 `TARGETS` 可以筛选目标。筛选一个架构时会构建该架构的全部 CPU 变体和 flavor：
-
-```bash
-docker build \
-  --target artifacts \
-  --build-arg "TARGETS=x86_64-linux-musl aarch64-linux-musl" \
-  --output type=local,dest=build/docker \
-  .
-```
-
-只需要不含 DoT 的普通版本时，可以指定 `FLAVORS=plain`；如不需要额外的 `wolfssl_noasm` 版本，可以指定 `NOASM=0`：
-
-```bash
-docker build \
-  --target artifacts \
-  --build-arg FLAVORS=plain \
-  --build-arg NOASM=0 \
-  --output type=local,dest=build/docker \
-  .
-```
-
-也可以像使用常规编译工具镜像一样，先构建可复用的工具链镜像，再挂载源码目录。默认构建完整矩阵；镜像名后的参数用于筛选目标：
-
-```bash
-docker build -t chinadns-ng-builder .
-
-# 构建全部目标
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  --mount type=bind,src="$PWD",dst=/src \
-  chinadns-ng-builder
-
-# 只构建指定目标
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  --mount type=bind,src="$PWD",dst=/src \
-  chinadns-ng-builder \
-  x86_64-linux-musl aarch64-linux-musl
-```
-
-工具链镜像可在 Linux amd64 或 arm64 环境中构建，生成的目标架构与构建环境架构无关。挂载源码目录时，产物位于宿主机的 `build/release/`，wolfSSL 源码和各目标的中间产物缓存在 `build/.release-cache/`。
-
-</p></details>
-
-## Docker
-
-因为要访问内核的 ipset/nftset，docker run 时请带上 `--privileged` 参数。
-
-请前往 [releases](https://github.com/zfl9/chinadns-ng/releases) 页面下载可执行文件（无依赖），cp 至目标容器，运行即可。
+请前往 [releases](https://github.com/zfl9/chinadns-ng/releases) 页面下载静态可执行文件，将其复制到目标容器后运行。静态版本无需额外的动态链接库。
 
 ## OpenWrt
 
