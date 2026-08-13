@@ -333,7 +333,8 @@ build_chinadns() {
         MIPS_SOFT_FP="$mips_soft_fp" \
         ZIG_GLOBAL_CACHE_DIR="$cache/zig-project-$target-$cpu_label-$flavor$cache_suffix" \
             "$zig" cc "$@" -DMUSL -DENABLE_WOLFSSL -Isrc \
-                -I"$wolfssl_prefix/include" -std=gnu11 -O3 $lto -s -static \
+                -I"$wolfssl_prefix/include" -include "$root/tool/wolfssl-options.h" \
+                -std=gnu11 -O3 $lto -s -static \
                 -Wall -Wextra -fno-strict-aliasing -ffunction-sections -fdata-sections \
                 -Wl,--gc-sections $sources $compatibility_source \
                 -L"$wolfssl_prefix/lib" -lwolfssl -lm \
