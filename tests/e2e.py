@@ -55,9 +55,11 @@ def recv_exact(sock, size):
 
 
 class MockDNS:
-    def __init__(self, address, drop_first=0, close_after_reply=False, ttl=60):
+    def __init__(self, address, drop_first=0, close_after_reply=False, ttl=60, drop=False, mangle=False):
         self.address = address
         self.drop_first = drop_first
+        self.drop = drop  # runtime toggle: silently discard every query
+        self.mangle = mangle  # runtime toggle: reply with a malformed message
         self.close_after_reply = close_after_reply
         self.ttl = ttl
         self.port = free_port()
@@ -88,6 +90,14 @@ class MockDNS:
         self.udp.close()
         self.tcp.close()
 
+    def mangled_reply(self, query, sock, peer=None):
+        # a reply with the query's qid but a corrupted question section
+        mangled = struct.pack("!HH", struct.unpack_from("!H", query)[0], 0x8180) + b"\xff" * 16
+        if peer is None:
+            sock.sendall(struct.pack("!H", len(mangled)) + mangled)
+        else:
+            sock.sendto(mangled, peer)
+
     def udp_loop(self):
         while not self.stop_event.is_set():
             try:
@@ -95,8 +105,13 @@ class MockDNS:
             except TimeoutError:
                 continue
             self.counts["udp"] += 1
+            if self.drop:
+                continue
             if self.drop_first:
                 self.drop_first -= 1
+                continue
+            if self.mangle:
+                self.mangled_reply(query, self.udp, peer)
                 continue
             self.udp.sendto(make_answer(query, self.address, self.ttl), peer)
 
@@ -118,14 +133,50 @@ class MockDNS:
                 except (EOFError, OSError, TimeoutError):
                     return
                 self.counts["tcp"] += 1
+                if self.drop:
+                    continue
                 if self.drop_first:
                     self.drop_first -= 1
+                    continue
+                if self.mangle:
+                    self.mangled_reply(query, conn)
                     continue
                 answer = make_answer(query, self.address, self.ttl)
                 conn.sendall(struct.pack("!H", len(answer)) + answer)
                 if self.close_after_reply:
                     conn.shutdown(socket.SHUT_WR)
                     return
+
+
+class FlappingTCP:
+    """accepts a connection, reads whatever arrives, closes it immediately"""
+    def __init__(self):
+        self.port = free_port()
+        self.stop_event = threading.Event()
+        self.connections = 0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", self.port))
+        self.sock.listen()
+        self.sock.settimeout(0.1)
+
+    def start(self):
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def close(self):
+        self.stop_event.set()
+        self.sock.close()
+
+    def loop(self):
+        while not self.stop_event.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            self.connections += 1
+            conn.close()
 
 
 class MockDoT:
@@ -588,6 +639,227 @@ def check_rotation_and_timeout(binary):
         delayed.close()
 
 
+def check_fallback(binary):
+    # a group with ?fallback upstream(s) must also have a primary upstream
+    mock = MockDNS("192.0.2.1")
+    mock.start()
+    try:
+        ChinaDNS(binary, "--default-tag", "chn",
+                 "--china-dns", f"udp://127.0.0.1#{mock.port}?fallback")
+        raise AssertionError("group without a primary upstream unexpectedly started")
+    except RuntimeError as error:
+        assert "fallback upstream without primary upstream" in str(error), error
+    finally:
+        mock.close()
+
+    primary = MockDNS("203.0.113.1")
+    backup = MockDNS("198.51.100.1")
+    primary.start()
+    backup.start()
+    server = ChinaDNS(
+        binary,
+        "--default-tag", "chn",
+        "--timeout-sec", "1",
+        "--verbose",
+        "--china-dns",
+        f"udp://127.0.0.1#{primary.port}?count=0?life=0,"
+        f"udp://127.0.0.1#{backup.port}?count=0?life=0?fallback",
+    )
+    try:
+        # steady state: only the primary upstream is queried
+        assert answer_ip(server.query("fallback-healthy.example"))[0] == "203.0.113.1"
+        assert backup.counts["udp"] == 0, backup.counts
+
+        # primary goes silent: the pending query times out, then the group also
+        # queries the ?fallback upstream, which answers
+        primary.drop = True
+        try:
+            server.query("fallback-down.example")
+            raise AssertionError("query to the dead primary unexpectedly received a reply")
+        except TimeoutError:
+            pass
+        assert answer_ip(server.query("fallback-takeover.example"))[0] == "198.51.100.1"
+        assert backup.counts["udp"] >= 1, backup.counts
+
+        # primary recovers: a primary reply marks the group healthy again, so the
+        # next query goes to the primary only and the fallback is left alone
+        primary.drop = False
+        assert answer_ip(server.query("fallback-recover.example"))[0] in ("203.0.113.1", "198.51.100.1")
+        time.sleep(0.3)
+        received = backup.counts["udp"]
+        assert answer_ip(server.query("fallback-back.example"))[0] == "203.0.113.1"
+        assert backup.counts["udp"] == received, backup.counts
+
+        # malformed primary replies must not count as a recovery signal, nor
+        # block a later good reply from recovering the group
+        primary.mangle = True
+        try:
+            server.query("fallback-mangle.example")
+            raise AssertionError("query answered by a mangled reply")
+        except TimeoutError:
+            pass
+        assert answer_ip(server.query("fallback-mangle-fb.example"))[0] == "198.51.100.1"
+        primary.mangle = False
+        assert answer_ip(server.query("fallback-unmangle.example"))[0] in ("203.0.113.1", "198.51.100.1")
+        time.sleep(0.3)
+        received = backup.counts["udp"]
+        assert answer_ip(server.query("fallback-unmangle-back.example"))[0] == "203.0.113.1"
+        assert backup.counts["udp"] == received, backup.counts
+    finally:
+        output = server.close()
+        primary.close()
+        backup.close()
+        assert "passive health-check enabled" in output, output
+        assert "unresponsive, also querying ?fallback" in output, output
+        assert "recovered, stop querying ?fallback" in output, output
+
+
+def check_fallback_tcp_primary(binary):
+    primary = MockDNS("203.0.113.3")
+    backup = MockDNS("198.51.100.3")
+    primary.start()
+    backup.start()
+    server = ChinaDNS(
+        binary,
+        "--default-tag", "chn",
+        "--timeout-sec", "1",
+        "--china-dns",
+        f"tcp://127.0.0.1#{primary.port}?count=0?life=0,"
+        f"udp://127.0.0.1#{backup.port}?count=0?life=0?fallback",
+    )
+    try:
+        assert answer_ip(server.query("fb-tcp.example"))[0] == "203.0.113.3"
+        assert backup.counts == {"udp": 0, "tcp": 0}, backup.counts
+        primary.drop = True
+        try:
+            server.query("fb-tcp-down.example")
+            raise AssertionError("query to the dead primary unexpectedly received a reply")
+        except TimeoutError:
+            pass
+        assert answer_ip(server.query("fb-tcp-over.example"))[0] == "198.51.100.3"
+        assert backup.counts["udp"] >= 1, backup.counts
+        primary.drop = False
+        assert answer_ip(server.query("fb-tcp-recover.example"))[0] in ("203.0.113.3", "198.51.100.3")
+        time.sleep(0.3)
+        received = backup.counts["udp"]
+        assert answer_ip(server.query("fb-tcp-back.example"))[0] == "203.0.113.3"
+        assert backup.counts["udp"] == received, backup.counts
+    finally:
+        server.close()
+        primary.close()
+        backup.close()
+
+
+def check_fallback_groups(binary):
+    # trust-dns group
+    primary = MockDNS("203.0.113.4")
+    backup = MockDNS("198.51.100.4")
+    primary.start()
+    backup.start()
+    server = ChinaDNS(
+        binary,
+        "--default-tag", "gfw",
+        "--timeout-sec", "1",
+        "--trust-dns",
+        f"udp://127.0.0.1#{primary.port}?count=0?life=0,"
+        f"udp://127.0.0.1#{backup.port}?count=0?life=0?fallback",
+    )
+    try:
+        assert answer_ip(server.query("fb-trust.example"))[0] == "203.0.113.4"
+        assert backup.counts["udp"] == 0, backup.counts
+        primary.drop = True
+        try:
+            server.query("fb-trust-down.example")
+            raise AssertionError("query to the dead primary unexpectedly received a reply")
+        except TimeoutError:
+            pass
+        assert answer_ip(server.query("fb-trust-over.example"))[0] == "198.51.100.4"
+    finally:
+        server.close()
+        primary.close()
+        backup.close()
+
+    # user-defined group via --group-upstream
+    primary = MockDNS("203.0.113.5")
+    backup = MockDNS("198.51.100.5")
+    primary.start()
+    backup.start()
+    with tempfile.TemporaryDirectory() as directory:
+        domains = os.path.join(directory, "group.txt")
+        with open(domains, "w", encoding="utf-8") as file:
+            file.write("fb-grp.example\nfb-grp-down.example\nfb-grp-over.example\n")
+        server = ChinaDNS(
+            binary,
+            "--default-tag", "chn",
+            "--timeout-sec", "1",
+            "--group", "custom",
+            "--group-dnl", domains,
+            "--group-upstream",
+            f"udp://127.0.0.1#{primary.port}?count=0?life=0,"
+            f"udp://127.0.0.1#{backup.port}?count=0?life=0?fallback",
+        )
+        try:
+            assert answer_ip(server.query("fb-grp.example"))[0] == "203.0.113.5"
+            assert backup.counts["udp"] == 0, backup.counts
+            primary.drop = True
+            try:
+                server.query("fb-grp-down.example")
+                raise AssertionError("query to the dead primary unexpectedly received a reply")
+            except TimeoutError:
+                pass
+            assert answer_ip(server.query("fb-grp-over.example"))[0] == "198.51.100.5"
+        finally:
+            server.close()
+            primary.close()
+            backup.close()
+
+
+def check_no_fallback_log_noise(binary):
+    # a plain group without any ?fallback upstream must never report fallback
+    # health transitions (regression: spurious "recovered" log)
+    mock = MockDNS("203.0.113.6")
+    mock.start()
+    server = ChinaDNS(
+        binary,
+        "--default-tag", "chn",
+        "--verbose",
+        "--china-dns", f"udp://127.0.0.1#{mock.port}?count=0?life=0",
+    )
+    try:
+        assert answer_ip(server.query("plain.example"))[0] == "203.0.113.6"
+    finally:
+        output = server.close()
+        mock.close()
+    assert "?fallback" not in output, output
+
+
+def check_fallback_no_amplification(binary):
+    # regression: without ?fallback, a TCP upstream must not re-send requests
+    # whose query already completed elsewhere (another upstream won the race);
+    # lingering entries and reconnect resends are fallback-group-only behavior
+    fast = MockDNS("198.51.100.7")
+    flap = FlappingTCP()
+    fast.start()
+    flap.start()
+    server = ChinaDNS(
+        binary,
+        "--default-tag", "chn",
+        "--china-dns",
+        f"udp://127.0.0.1#{fast.port}?count=0?life=0,"
+        f"tcp://127.0.0.1#{flap.port}?count=0?life=0",
+    )
+    try:
+        assert answer_ip(server.query("no-amplify.example"))[0] == "198.51.100.7"
+        # the flapping upstream sees the initial connection only; every retry
+        # attempt within the timeout window would be another accept
+        time.sleep(1.5)
+        assert flap.connections <= 2, flap.connections
+    finally:
+        server.close()
+        fast.close()
+        flap.close()
+
+
 def check_resource_exhaustion(binary):
     server = ChinaDNS(
         binary,
@@ -726,6 +998,11 @@ def main():
     check_cache(binary)
     check_config_and_groups(binary)
     check_rotation_and_timeout(binary)
+    check_fallback(binary)
+    check_fallback_tcp_primary(binary)
+    check_fallback_groups(binary)
+    check_no_fallback_log_noise(binary)
+    check_fallback_no_amplification(binary)
     if os.environ.get("CHINADNS_TEST_SKIP_RESOURCE") != "1":
         check_resource_exhaustion(binary)
     check_hash_growth(binary)
@@ -733,7 +1010,7 @@ def main():
         check_verdict(binary)
     if os.environ.get("CHINADNS_TEST_DOT") == "1":
         check_dot(binary)
-    print("e2e: local records, UDP/TCP, raw routing, cache, rotation, timeout: PASS")
+    print("e2e: local records, UDP/TCP, raw routing, cache, rotation, timeout, fallback: PASS")
 
 
 if __name__ == "__main__":

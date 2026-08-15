@@ -101,6 +101,7 @@ struct query {
 struct pending_id {
     struct pending_id *next;
     u16 qid;
+    u64 expire_at; /* monotime(ms) after which a lingering entry is purged */
 };
 
 struct tcp_request {
@@ -108,6 +109,7 @@ struct tcp_request {
     size_t offset;
     size_t frame_len;
     u16 qid;
+    u64 expire_at; /* monotime(ms) after which a lingering entry is purged */
     bool sent;
     u8 frame[];
 };
@@ -120,8 +122,9 @@ struct upstream_session {
     struct upstream_config *config;
     u64 create_time;
     u64 retry_at;
+    u64 oldest_linger_at; /* earliest expire_at among lingering entries; 0 = none */
     u16 query_count;
-    u16 pending_count;
+    u32 pending_count;
     bool retired;
     bool tcp;
     union {
@@ -438,6 +441,7 @@ static void session_mark_retired(struct upstream_session *s) {
 static void udp_pending_add(struct upstream_session *s, u16 qid) {
     struct pending_id *id = xmalloc(sizeof(*id));
     id->qid = qid;
+    id->expire_at = now_msec() + (u64)g_config.upstream_timeout * 1000;
     id->next = s->u.udp.ids;
     s->u.udp.ids = id;
     ++s->pending_count;
@@ -471,11 +475,10 @@ static void udp_session_read(struct upstream_session *s) {
                 log_verbose("ignore reply from unexpected peer of %s", s->config->url);
             } else {
                 msg->len = (u16)n;
-                if (n >= dns_header_len()) udp_pending_remove(s, dns_get_id(msg->data));
                 upstream_on_reply(s, msg);
             }
             message_unref(msg);
-            /* a reply may have detached the source (last pending entry of a
+            /* on_reply may have detached the source (last pending entry of a
              * retired session): stop before touching the dead fd */
             if (s->source.closed) return;
         } else {
@@ -488,10 +491,12 @@ static void udp_session_read(struct upstream_session *s) {
     }
 }
 
-static void tcp_request_remove(struct upstream_session *s, u16 qid) {
+/* remove the request of qmsg; returns whether the reply matched one of this
+ * session's outstanding queries (gates the passive health-check recovery) */
+static bool tcp_request_remove(struct upstream_session *s, u16 qid) {
     struct tcp_request **p = &s->u.tcp.head;
     while (*p && (*p)->qid != qid) p = &(*p)->next;
-    if (!*p) return;
+    if (!*p) return false;
     struct tcp_request *req = *p;
     *p = req->next;
     if (s->u.tcp.tail == req) {
@@ -500,6 +505,27 @@ static void tcp_request_remove(struct upstream_session *s, u16 qid) {
     }
     free(req);
     --s->pending_count;
+    return true;
+}
+
+/* remove the pending entry of qid; returns whether the reply matched one of
+ * this session's outstanding queries. called from upstream_on_reply only
+ * after the reply passed validation, so a malformed reply does not consume
+ * the entry (and thus cannot silence a later real reply).
+ * note: a lingering entry's qid can be reused by a new query (query_new only
+ * avoids ids of live queries); a reply then consumes the stale entry first.
+ * this only skews the matched bookkeeping for health purposes and requires
+ * wrapping the whole 16-bit qid space within one timeout window. */
+static bool session_pending_remove(struct upstream_session *s, u16 qid) {
+    return s->tcp ? tcp_request_remove(s, qid) : udp_pending_remove(s, qid);
+}
+
+/* lingering session entries (and their tcp resend) only serve the passive
+ * health-check: only a primary (non-fallback) upstream of a group that has
+ * ?fallback upstream(s) needs late replies to still match, as recovery
+ * signals. every other session behaves exactly like before this feature. */
+static bool session_needs_linger(const struct upstream_session *s) {
+    return g_config.groups[s->config->tag].fallback_enabled && !s->config->fallback;
 }
 
 static void tcp_reset_input(struct upstream_session *s) {
@@ -528,14 +554,21 @@ static void tcp_disconnect(struct upstream_session *s, bool retry) {
     source_detach(&s->source);
     s->u.tcp.state = TCP_DOWN;
     tcp_reset_input(s);
+    bool linger = session_needs_linger(s);
     struct tcp_request **p = &s->u.tcp.head;
     while (*p) {
         struct tcp_request *req = *p;
-        if (!query_find(req->qid)) {
+        if (!linger && !query_find(req->qid)) {
+            /* not serving the health-check: drop requests whose query already
+             * completed elsewhere (the pre-fallback behavior) */
             *p = req->next;
             free(req);
             --s->pending_count;
         } else {
+            /* keep the request: for a linger session, an entry for a query
+             * completed elsewhere is still a recovery signal until it ages out
+             * (its own expire_at); it is resent on reconnect, like the Zig
+             * version's send_list */
             req->offset = 0;
             req->sent = false;
             p = &req->next;
@@ -789,7 +822,6 @@ static void tcp_session_read(struct upstream_session *s) {
         s->u.tcp.input = NULL;
         s->u.tcp.input_have = 0;
         s->u.tcp.len_have = 0;
-        if (msg->len >= dns_header_len()) tcp_request_remove(s, dns_get_id(msg->data));
         upstream_on_reply(s, msg);
         message_unref(msg);
         if (s->retired && !s->pending_count) {
@@ -850,8 +882,9 @@ static struct upstream_session *session_get(struct upstream_config *config) {
 static void session_send(struct upstream_config *config, struct message *msg) {
     struct upstream_session *s = session_get(config);
     u16 qid = dns_get_id(msg->data);
+    u64 now = now_msec();
     if (!s->tcp) {
-        if (s->source.closed && (!s->retry_at || now_msec() >= s->retry_at))
+        if (s->source.closed && (!s->retry_at || now >= s->retry_at))
             udp_start(s);
         if (s->source.closed) {
             ++s->query_count;
@@ -871,6 +904,7 @@ static void session_send(struct upstream_config *config, struct message *msg) {
         struct tcp_request *req = xcalloc(1, sizeof(*req) + frame_len);
         req->qid = qid;
         req->frame_len = frame_len;
+        req->expire_at = now + (u64)g_config.upstream_timeout * 1000;
         req->frame[0] = (u8)(msg->len >> 8);
         req->frame[1] = (u8)msg->len;
         memcpy(req->frame + 2, msg->data, msg->len);
@@ -884,15 +918,40 @@ static void session_send(struct upstream_config *config, struct message *msg) {
     ++s->query_count;
 }
 
+/* [passive health-check] a good reply just arrived from a primary (non-fallback)
+ * upstream of this group -> primaries are alive. clears the outstanding marker
+ * and, if the group was unhealthy, switches back to primary-only. */
+static void group_primary_alive(u8 tag) {
+    struct group_config *group = &g_config.groups[tag];
+    if (!group->fallback_enabled) return; /* health tracking is fallback-only */
+    group->pending_since = 0;
+    if (!group->primary_healthy) {
+        group->primary_healthy = true;
+        log_info("tag:%s primary upstream(s) recovered, stop querying ?fallback", tag_to_name(tag));
+    }
+}
+
 static void send_group(u8 tag, struct message *msg, bool raw_udp) {
-    struct upstream_vec *vec = &g_config.groups[tag].upstreams;
+    struct group_config *group = &g_config.groups[tag];
+    struct upstream_vec *vec = &group->upstreams;
+    /* primary upstreams are always queried; fallback upstreams are queried too
+     * only while the group is unhealthy (so they back up the primaries, while
+     * the primaries' real replies keep flowing in to detect recovery) */
+    bool send_fallback = !group->primary_healthy;
+    bool sent_primary = false;
     for (size_t i = 0; i < vec->len; ++i) {
         struct upstream_config *config = &vec->items[i];
+        if (config->fallback && !send_fallback) continue;
         if (config->proto == UP_RAW_UDP && !raw_udp) continue;
         if (config->proto == UP_RAW_TCP && raw_udp) continue;
         log_verbose("forward qid:%u to %s", (uint)dns_get_id(msg->data), config->url);
         session_send(config, msg);
+        if (!config->fallback) sent_primary = true;
     }
+    /* passive health-check: remember when the primary path has an outstanding
+     * (so-far unanswered) query, so group_health_check can detect all-primary-down */
+    if (group->fallback_enabled && sent_primary && !group->pending_since)
+        group->pending_since = now_msec();
 }
 
 static void handle_query(struct message *msg, enum query_from from,
@@ -999,6 +1058,23 @@ static void upstream_on_reply(struct upstream_session *session, struct message *
     }
     reply->len = new_len;
     u16 qid = dns_get_id(reply->data);
+
+    /* consume the pending entry only now, after the reply passed validation:
+     * `matched` = the reply answers one of this session's outstanding queries */
+    bool matched = session_pending_remove(session, qid);
+
+    /* passive health-check: a good reply (rcode noerror/nxdomain, not truncated)
+     * that actually answers one of this primary (non-fallback) upstream's
+     * outstanding queries means the group's primaries are alive. gated on
+     * `matched` (the upstream session's own pending ids), not on the global
+     * query list: while unhealthy the fallback may have already answered &
+     * removed the query, yet this "late" primary reply still matches the
+     * primary session's pending id and is exactly the recovery signal,
+     * whereas a duplicate / unsolicited / spoofed reply matches no pending id
+     * and is ignored. */
+    if (matched && !session->config->fallback && dns_is_good(reply->data))
+        group_primary_alive(session->config->tag);
+
     struct query *q = query_find(qid);
     if (!q) return;
     dns_set_id(reply->data, q->original_id);
@@ -1213,14 +1289,28 @@ static void cleanup_pending(void) {
         query_delete(q);
     }
     for (struct upstream_session *s = sessions; s; s = s->next) {
+        /* an entry whose query is already completed elsewhere (another upstream
+         * won the race) lingers until its own expire_at (send time + timeout)
+         * only on sessions serving the passive health-check, so a late reply
+         * can still be recognized (matched) as a primary-recovery signal; each
+         * entry ages out independently, so sustained traffic can not make old
+         * entries pile up forever. all other sessions drop such entries right
+         * away, exactly like before this feature. */
+        bool linger = session_needs_linger(s);
+        u64 oldest = 0; /* min expire_at among the lingering entries left */
         if (!s->tcp) {
             struct pending_id **p = &s->u.udp.ids;
             while (*p) {
                 struct pending_id *id = *p;
                 if (!query_find(id->qid)) {
-                    *p = id->next;
-                    free(id);
-                    --s->pending_count;
+                    if (linger && now < id->expire_at) {
+                        if (!oldest || id->expire_at < oldest) oldest = id->expire_at;
+                        p = &id->next;
+                    } else {
+                        *p = id->next;
+                        free(id);
+                        --s->pending_count;
+                    }
                 } else p = &id->next;
             }
             if (s->retired && !s->pending_count) source_detach(&s->source);
@@ -1229,9 +1319,14 @@ static void cleanup_pending(void) {
             while (*p) {
                 struct tcp_request *req = *p;
                 if (!query_find(req->qid)) {
-                    *p = req->next;
-                    free(req);
-                    --s->pending_count;
+                    if (linger && now < req->expire_at) {
+                        if (!oldest || req->expire_at < oldest) oldest = req->expire_at;
+                        p = &req->next;
+                    } else {
+                        *p = req->next;
+                        free(req);
+                        --s->pending_count;
+                    }
                 } else {
                     p = &req->next;
                 }
@@ -1246,6 +1341,7 @@ static void cleanup_pending(void) {
                 tcp_start(s);
             }
         }
+        s->oldest_linger_at = oldest;
     }
 }
 
@@ -1269,6 +1365,23 @@ static void sessions_sweep(void) {
     }
 }
 
+/* [passive health-check] flip a group to unhealthy once its primary upstreams
+ * have stayed unanswered for `timeout-sec`, so queries also go to ?fallback */
+static void group_health_check(void) {
+    u64 timeout_ms = (u64)g_config.upstream_timeout * 1000;
+    u64 now = now_msec();
+    for (u8 tag = 0; tag <= TAG__MAX; ++tag) {
+        struct group_config *group = &g_config.groups[tag];
+        if (!group->fallback_enabled || !group->primary_healthy || !group->pending_since)
+            continue;
+        if (now >= group->pending_since + timeout_ms) {
+            group->primary_healthy = false;
+            log_warning("tag:%s primary upstream(s) unresponsive, also querying ?fallback",
+                tag_to_name(tag));
+        }
+    }
+}
+
 static int next_timeout(void) {
     u64 now = now_msec();
     u64 deadline = UINT64_MAX;
@@ -1276,9 +1389,22 @@ static int next_timeout(void) {
         struct query *q = container_of(query_deadlines.next, struct query, deadline);
         deadline = q->request_time + (u64)g_config.upstream_timeout * 1000;
     }
-    for (struct upstream_session *s = sessions; s; s = s->next)
+    for (struct upstream_session *s = sessions; s; s = s->next) {
         if (s->tcp && s->u.tcp.state == TCP_DOWN && s->pending_count && s->retry_at && s->retry_at < deadline)
             deadline = s->retry_at;
+        /* wake up to age out lingering session entries (cleanup_pending keeps
+         * this field fresh; 0 means nothing is lingering) */
+        if (s->oldest_linger_at && s->oldest_linger_at < deadline)
+            deadline = s->oldest_linger_at;
+    }
+    /* keep the epoll wait in sync with the passive health-check deadline */
+    u64 timeout_ms = (u64)g_config.upstream_timeout * 1000;
+    for (u8 tag = 0; tag <= TAG__MAX; ++tag) {
+        struct group_config *group = &g_config.groups[tag];
+        if (group->fallback_enabled && group->primary_healthy && group->pending_since &&
+            group->pending_since + timeout_ms < deadline)
+            deadline = group->pending_since + timeout_ms;
+    }
     if (deadline == UINT64_MAX) return -1;
     if (deadline <= now) return 0;
     u64 delay = deadline - now;
@@ -1361,6 +1487,9 @@ void server_init(void) {
 #endif
             log_info("tag:%s upstream: %s", tag_to_name(tag), group->upstreams.items[i].url);
         }
+        if (group->fallback_enabled)
+            log_info("tag:%s ?fallback upstream(s): passive health-check enabled",
+                tag_to_name(tag));
     }
     if (need_ip_test) {
         size_t len = strlen(g_config.chnroute_name) + strlen(g_config.chnroute6_name) + 2;
@@ -1438,6 +1567,7 @@ void server_run(void) {
             }
         }
         cleanup_pending();
+        group_health_check();
         clients_sweep();
         sessions_sweep();
     }

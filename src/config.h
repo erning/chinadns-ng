@@ -19,6 +19,7 @@ struct upstream_config {
     u16 count;
     u16 life;
     u8 tag;
+    bool fallback; /* queried (alongside primaries) only while the group is unhealthy */
     void *runtime;
 };
 
@@ -38,6 +39,16 @@ struct group_config {
     struct upstream_vec upstreams;
     char *ipset_name46;
     struct ip6_filter ip6;
+
+    /* passive health-check of the primary (non-fallback) upstreams, enabled when
+     * the group has `?fallback` upstream(s). `primary_healthy == true` is the
+     * steady state: only primaries are queried; `false` means primaries went
+     * silent, so fallbacks are queried too. driven by real query results only:
+     * a good primary reply sets it true (`group_primary_alive`), `pending_since`
+     * ageing out flips it false (`group_health_check`). */
+    bool fallback_enabled;
+    bool primary_healthy;
+    u64 pending_since; /* monotime(ms) of the oldest unanswered primary query, 0 = none */
 };
 
 struct bind_port {

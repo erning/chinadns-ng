@@ -69,8 +69,12 @@ static void upstream_push(struct upstream_vec *vec, const struct upstream_config
             strcmp(old->host ? old->host : "", upstream->host ? upstream->host : "") == 0) {
             old->count = upstream->count;
             old->life = upstream->life;
+            old->fallback = upstream->fallback;
+            /* the URL must reflect the latest spec, e.g. when the same upstream
+             * is repeated with ?fallback, so startup logs show the real config */
+            free(old->url);
+            old->url = upstream->url; /* ownership moved; the caller's copy is a stack temp */
             free(upstream->host);
-            free(upstream->url);
             return;
         }
     }
@@ -82,7 +86,7 @@ static void upstream_push(struct upstream_vec *vec, const struct upstream_config
 }
 
 static void add_one_upstream(u8 tag, enum upstream_proto proto, const char *host,
-    const char *ip, u16 port, u16 count, u16 life, const char *source) {
+    const char *ip, u16 port, u16 count, u16 life, bool fallback, const char *source) {
     struct upstream_config u = {
         .proto = proto,
         .host = *host ? xstrdup(host) : NULL,
@@ -90,6 +94,7 @@ static void add_one_upstream(u8 tag, enum upstream_proto proto, const char *host
         .count = count,
         .life = life,
         .tag = tag,
+        .fallback = fallback,
     };
     if (!socket_addr_parse(&u.addr, ip, port))
         fail("invalid upstream IP", ip);
@@ -125,9 +130,14 @@ static void parse_upstream(u8 tag, const char *source) {
 
     u16 count = 10;
     u16 life = 10;
+    bool fallback = false;
     char *query;
     while ((query = strrchr(rest, '?')) != NULL) {
         *query++ = '\0';
+        if (strcmp(query, "fallback") == 0) { /* valueless flag */
+            fallback = true;
+            continue;
+        }
         char *eq = strchr(query, '=');
         if (!eq) fail("invalid upstream parameter", query);
         *eq++ = '\0';
@@ -146,10 +156,10 @@ static void parse_upstream(u8 tag, const char *source) {
     if (!*rest) fail("missing upstream IP", source);
 
     if (!scheme) {
-        add_one_upstream(tag, UP_RAW_UDP, "", rest, port, count, life, source);
-        add_one_upstream(tag, UP_RAW_TCP, "", rest, port, count, life, source);
+        add_one_upstream(tag, UP_RAW_UDP, "", rest, port, count, life, fallback, source);
+        add_one_upstream(tag, UP_RAW_TCP, "", rest, port, count, life, fallback, source);
     } else {
-        add_one_upstream(tag, proto, host, rest, port, count, life, source);
+        add_one_upstream(tag, proto, host, rest, port, count, life, fallback, source);
     }
     free(work);
 }
@@ -410,6 +420,18 @@ static void parse_config_file(const char *path) {
     --config_depth;
 }
 
+static bool group_has_fallback(const struct upstream_vec *vec) {
+    for (size_t i = 0; i < vec->len; ++i)
+        if (vec->items[i].fallback) return true;
+    return false;
+}
+
+static bool group_has_primary(const struct upstream_vec *vec) {
+    for (size_t i = 0; i < vec->len; ++i)
+        if (!vec->items[i].fallback) return true;
+    return false;
+}
+
 static void finalize(void) {
     if (!g_config.bind_ips.len) strvec_push(&g_config.bind_ips, "127.0.0.1");
     if (!g_config.bind_ports.len) bind_port_push(65353, true, true);
@@ -433,6 +455,17 @@ static void finalize(void) {
             fail("user group has no domain list", tag_to_name(tag));
         if (!tag_is_null(tag) && !g_config.groups[tag].upstreams.len)
             fail("user group has no upstream", tag_to_name(tag));
+    }
+
+    for (u8 tag = 0; tag <= TAG__MAX; ++tag) {
+        struct group_config *group = &g_config.groups[tag];
+        /* like the Zig version, every group starts healthy (also groups without
+         * ?fallback upstreams, for which the health flag is simply unused) */
+        group->primary_healthy = true;
+        if (!group->upstreams.len || !group_has_fallback(&group->upstreams)) continue;
+        if (!group_has_primary(&group->upstreams))
+            fail("fallback upstream without primary upstream", tag_to_name(tag));
+        group->fallback_enabled = true;
     }
 }
 
