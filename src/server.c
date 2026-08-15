@@ -460,12 +460,24 @@ static void upstream_on_reply(struct upstream_session *session, struct message *
 static void udp_session_read(struct upstream_session *s) {
     for (;;) {
         struct message *msg = message_new(DNS_EDNS_MAXSIZE);
-        ssize_t n = recvfrom(s->source.fd, msg->data, msg->cap, 0, NULL, NULL);
+        struct socket_addr peer = { .len = sizeof(peer.storage) };
+        ssize_t n = recvfrom(s->source.fd, msg->data, msg->cap, 0,
+            (struct sockaddr *)&peer.storage, &peer.len);
         if (n > 0) {
-            msg->len = (u16)n;
-            if (n >= dns_header_len()) udp_pending_remove(s, dns_get_id(msg->data));
-            upstream_on_reply(s, msg);
+            /* the socket only ever queries config->addr: a reply from any other
+             * source is unsolicited (spoofed) and must be dropped */
+            if (peer.len != s->config->addr.len ||
+                memcmp(&peer.storage, &s->config->addr.storage, peer.len) != 0) {
+                log_verbose("ignore reply from unexpected peer of %s", s->config->url);
+            } else {
+                msg->len = (u16)n;
+                if (n >= dns_header_len()) udp_pending_remove(s, dns_get_id(msg->data));
+                upstream_on_reply(s, msg);
+            }
             message_unref(msg);
+            /* a reply may have detached the source (last pending entry of a
+             * retired session): stop before touching the dead fd */
+            if (s->source.closed) return;
         } else {
             message_unref(msg);
             if (n < 0 && errno == EINTR) continue;
