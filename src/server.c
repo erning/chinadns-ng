@@ -80,9 +80,21 @@ struct tcp_client {
 enum query_from { QUERY_UDP, QUERY_TCP, QUERY_LOCAL };
 enum query_verdict { VERDICT_UNKNOWN, VERDICT_CHINA, VERDICT_NON_CHINA };
 
+/* embedded in every session entry (udp pending id / tcp request): links the
+ * entry back to the query it was sent for, so query_delete can release its
+ * entries directly instead of cleanup_pending scanning for orphans. `query`
+ * is NULL once the query is gone (the entry is then an orphan, kept only on
+ * linger sessions until expire_at). */
+struct query_ref {
+    struct query_ref *q_next; /* next entry of the same query */
+    struct query *query;
+    struct upstream_session *session;
+};
+
 struct query {
     struct query *hash_next;
     struct list_node deadline;
+    struct query_ref *refs; /* session entries still holding this query */
     u64 request_time;
     u16 qid;
     u16 original_id;
@@ -98,14 +110,20 @@ struct query {
     struct message *trust_reply;
 };
 
+/* session entries are kept in send order, so `expire_at` grows along the list
+ * and the entries to purge are always a prefix (see cleanup_pending) */
 struct pending_id {
     struct pending_id *next;
+    struct pending_id *prev;
+    struct query_ref ref;
     u16 qid;
     u64 expire_at; /* monotime(ms) after which a lingering entry is purged */
 };
 
 struct tcp_request {
     struct tcp_request *next;
+    struct tcp_request *prev;
+    struct query_ref ref;
     size_t offset;
     size_t frame_len;
     u16 qid;
@@ -129,7 +147,8 @@ struct upstream_session {
     bool tcp;
     union {
         struct {
-            struct pending_id *ids;
+            struct pending_id *head;
+            struct pending_id *tail;
         } udp;
         struct {
             enum tcp_state state;
@@ -330,11 +349,74 @@ static struct query *query_find(u16 qid) {
     return NULL;
 }
 
+/* lingering session entries (and their tcp resend) only serve the passive
+ * health-check: only a primary (non-fallback) upstream of a group that has
+ * ?fallback upstream(s) needs late replies to still match, as recovery
+ * signals. every other session releases its entries as soon as the query is
+ * done, exactly like before this feature. */
+static bool session_needs_linger(const struct upstream_session *s) {
+    return g_config.groups[s->config->tag].fallback_enabled && !s->config->fallback;
+}
+
+/* detach the entry from the query that owns it; the entry itself survives as
+ * an orphan (only linger sessions keep those, until expire_at) */
+static void query_ref_release(struct query_ref *ref) {
+    if (!ref->query) return;
+    struct query_ref **p = &ref->query->refs;
+    while (*p && *p != ref) p = &(*p)->q_next;
+    if (*p) *p = ref->q_next;
+    ref->query = NULL;
+    ref->q_next = NULL;
+}
+
+/* unlink from the session and free; the caller has released the query ref */
+static void udp_pending_free(struct upstream_session *s, struct pending_id *id) {
+    if (id->prev) id->prev->next = id->next;
+    else s->u.udp.head = id->next;
+    if (id->next) id->next->prev = id->prev;
+    else s->u.udp.tail = id->prev;
+    free(id);
+    --s->pending_count;
+}
+
+static void tcp_request_free(struct upstream_session *s, struct tcp_request *req) {
+    if (req->prev) req->prev->next = req->next;
+    else s->u.tcp.head = req->next;
+    if (req->next) req->next->prev = req->prev;
+    else s->u.tcp.tail = req->prev;
+    free(req);
+    --s->pending_count;
+}
+
+/* release every session entry sent for this query: a session serving the
+ * passive health-check keeps its entry as an orphan (a late reply must still
+ * match, as a recovery signal) until cleanup_pending ages it out; every other
+ * session drops it right away, so nothing has to scan for orphans later. */
+static void query_release_refs(struct query *q) {
+    struct query_ref *ref = q->refs;
+    q->refs = NULL;
+    while (ref) {
+        struct query_ref *next = ref->q_next;
+        struct upstream_session *s = ref->session;
+        ref->query = NULL;
+        ref->q_next = NULL;
+        if (!session_needs_linger(s)) {
+            if (s->tcp)
+                tcp_request_free(s, container_of(ref, struct tcp_request, ref));
+            else
+                udp_pending_free(s, container_of(ref, struct pending_id, ref));
+            if (s->retired && !s->pending_count) source_detach(&s->source);
+        }
+        ref = next;
+    }
+}
+
 static void query_delete(struct query *q) {
     struct query **p = &query_buckets[query_bucket(q->qid)];
     while (*p && *p != q) p = &(*p)->hash_next;
     if (*p) *p = q->hash_next;
     list_remove(&q->deadline);
+    query_release_refs(q);
     message_unref(q->trust_reply);
     if (q->tcp_client) {
         if (!q->tcp_client->refs) abort();
@@ -438,23 +520,30 @@ static void session_mark_retired(struct upstream_session *s) {
     if (!s->pending_count) source_detach(&s->source);
 }
 
-static void udp_pending_add(struct upstream_session *s, u16 qid) {
-    struct pending_id *id = xmalloc(sizeof(*id));
+static void udp_pending_add(struct upstream_session *s, struct query *q, u16 qid) {
+    struct pending_id *id = xcalloc(1, sizeof(*id));
     id->qid = qid;
     id->expire_at = now_msec() + (u64)g_config.upstream_timeout * 1000;
-    id->next = s->u.udp.ids;
-    s->u.udp.ids = id;
+    id->ref.session = s;
+    id->ref.query = q;
+    id->ref.q_next = q->refs;
+    q->refs = &id->ref;
+    /* appended, so the list stays ordered by expire_at */
+    id->prev = s->u.udp.tail;
+    if (s->u.udp.tail) s->u.udp.tail->next = id;
+    else s->u.udp.head = id;
+    s->u.udp.tail = id;
     ++s->pending_count;
 }
 
 static bool udp_pending_remove(struct upstream_session *s, u16 qid) {
-    struct pending_id **p = &s->u.udp.ids;
-    while (*p && (*p)->qid != qid) p = &(*p)->next;
-    if (!*p) return false;
-    struct pending_id *id = *p;
-    *p = id->next;
-    free(id);
-    --s->pending_count;
+    /* newest first: if a lingering orphan shares the qid with a fresh entry
+     * (query_new only avoids ids of live queries), the fresh one wins */
+    struct pending_id *id = s->u.udp.tail;
+    while (id && id->qid != qid) id = id->prev;
+    if (!id) return false;
+    query_ref_release(&id->ref);
+    udp_pending_free(s, id);
     if (s->retired && !s->pending_count) source_detach(&s->source);
     return true;
 }
@@ -494,17 +583,12 @@ static void udp_session_read(struct upstream_session *s) {
 /* remove the request of qmsg; returns whether the reply matched one of this
  * session's outstanding queries (gates the passive health-check recovery) */
 static bool tcp_request_remove(struct upstream_session *s, u16 qid) {
-    struct tcp_request **p = &s->u.tcp.head;
-    while (*p && (*p)->qid != qid) p = &(*p)->next;
-    if (!*p) return false;
-    struct tcp_request *req = *p;
-    *p = req->next;
-    if (s->u.tcp.tail == req) {
-        s->u.tcp.tail = NULL;
-        for (struct tcp_request *it = s->u.tcp.head; it; it = it->next) s->u.tcp.tail = it;
-    }
-    free(req);
-    --s->pending_count;
+    /* newest first, see udp_pending_remove */
+    struct tcp_request *req = s->u.tcp.tail;
+    while (req && req->qid != qid) req = req->prev;
+    if (!req) return false;
+    query_ref_release(&req->ref);
+    tcp_request_free(s, req);
     return true;
 }
 
@@ -513,19 +597,10 @@ static bool tcp_request_remove(struct upstream_session *s, u16 qid) {
  * after the reply passed validation, so a malformed reply does not consume
  * the entry (and thus cannot silence a later real reply).
  * note: a lingering entry's qid can be reused by a new query (query_new only
- * avoids ids of live queries); a reply then consumes the stale entry first.
- * this only skews the matched bookkeeping for health purposes and requires
- * wrapping the whole 16-bit qid space within one timeout window. */
+ * avoids ids of live queries); the newest matching entry is consumed first,
+ * so the fresh query wins and only the stale orphan can be skewed. */
 static bool session_pending_remove(struct upstream_session *s, u16 qid) {
     return s->tcp ? tcp_request_remove(s, qid) : udp_pending_remove(s, qid);
-}
-
-/* lingering session entries (and their tcp resend) only serve the passive
- * health-check: only a primary (non-fallback) upstream of a group that has
- * ?fallback upstream(s) needs late replies to still match, as recovery
- * signals. every other session behaves exactly like before this feature. */
-static bool session_needs_linger(const struct upstream_session *s) {
-    return g_config.groups[s->config->tag].fallback_enabled && !s->config->fallback;
 }
 
 static void tcp_reset_input(struct upstream_session *s) {
@@ -554,28 +629,24 @@ static void tcp_disconnect(struct upstream_session *s, bool retry) {
     source_detach(&s->source);
     s->u.tcp.state = TCP_DOWN;
     tcp_reset_input(s);
-    bool linger = session_needs_linger(s);
-    struct tcp_request **p = &s->u.tcp.head;
-    while (*p) {
-        struct tcp_request *req = *p;
-        if (!linger && !query_find(req->qid)) {
-            /* not serving the health-check: drop requests whose query already
-             * completed elsewhere (the pre-fallback behavior) */
-            *p = req->next;
-            free(req);
-            --s->pending_count;
-        } else {
-            /* keep the request: for a linger session, an entry for a query
-             * completed elsewhere is still a recovery signal until it ages out
-             * (its own expire_at); it is resent on reconnect, like the Zig
-             * version's send_list */
+    /* requests still bound to a query are resent on reconnect, like the Zig
+     * version's send_list. an orphan — a lingering entry whose query was
+     * answered elsewhere — is dropped instead: it was only kept so a late
+     * reply on *this* connection could still match as a recovery signal, and
+     * the connection is gone. resending it would be pure duplicate traffic,
+     * and pointless besides: while a group is unhealthy every new query is
+     * sent to the primary anyway, so fresh traffic already probes it. */
+    struct tcp_request *req = s->u.tcp.head;
+    while (req) {
+        struct tcp_request *next = req->next;
+        if (req->ref.query) {
             req->offset = 0;
             req->sent = false;
-            p = &req->next;
+        } else {
+            tcp_request_free(s, req);
         }
+        req = next;
     }
-    s->u.tcp.tail = NULL;
-    for (struct tcp_request *it = s->u.tcp.head; it; it = it->next) s->u.tcp.tail = it;
     if (s->retired && !s->pending_count) return;
     if (retry && s->pending_count) s->retry_at = now_msec() + 250;
 }
@@ -879,7 +950,7 @@ static struct upstream_session *session_get(struct upstream_config *config) {
     return s;
 }
 
-static void session_send(struct upstream_config *config, struct message *msg) {
+static void session_send(struct upstream_config *config, struct query *q, struct message *msg) {
     struct upstream_session *s = session_get(config);
     u16 qid = dns_get_id(msg->data);
     u64 now = now_msec();
@@ -898,7 +969,7 @@ static void session_send(struct upstream_config *config, struct message *msg) {
             if (n == msg->len) any = true;
             else if (n < 0) log_warning("send(%s) failed: (%d) %s", config->url, errno, strerror(errno));
         }
-        if (any) udp_pending_add(s, qid);
+        if (any) udp_pending_add(s, q, qid);
     } else {
         size_t frame_len = 2 + msg->len;
         struct tcp_request *req = xcalloc(1, sizeof(*req) + frame_len);
@@ -908,6 +979,11 @@ static void session_send(struct upstream_config *config, struct message *msg) {
         req->frame[0] = (u8)(msg->len >> 8);
         req->frame[1] = (u8)msg->len;
         memcpy(req->frame + 2, msg->data, msg->len);
+        req->ref.session = s;
+        req->ref.query = q;
+        req->ref.q_next = q->refs;
+        q->refs = &req->ref;
+        req->prev = s->u.tcp.tail;
         if (s->u.tcp.tail) s->u.tcp.tail->next = req;
         else s->u.tcp.head = req;
         s->u.tcp.tail = req;
@@ -931,7 +1007,7 @@ static void group_primary_alive(u8 tag) {
     }
 }
 
-static void send_group(u8 tag, struct message *msg, bool raw_udp) {
+static void send_group(u8 tag, struct query *q, struct message *msg, bool raw_udp) {
     struct group_config *group = &g_config.groups[tag];
     struct upstream_vec *vec = &group->upstreams;
     /* primary upstreams are always queried; fallback upstreams are queried too
@@ -945,7 +1021,7 @@ static void send_group(u8 tag, struct message *msg, bool raw_udp) {
         if (config->proto == UP_RAW_UDP && !raw_udp) continue;
         if (config->proto == UP_RAW_TCP && raw_udp) continue;
         log_verbose("forward qid:%u to %s", (uint)dns_get_id(msg->data), config->url);
-        session_send(config, msg);
+        session_send(config, q, msg);
         if (!config->fallback) sent_primary = true;
     }
     /* passive health-check: remember when the primary path has an outstanding
@@ -1027,13 +1103,13 @@ static void handle_query(struct message *msg, enum query_from from,
         bool is_china;
         if (verdict_cache_get(msg->data, qnamelen, &is_china)) {
             q->verdict = is_china ? VERDICT_CHINA : VERDICT_NON_CHINA;
-            send_group(is_china ? TAG_CHN : TAG_GFW, msg, raw_udp);
+            send_group(is_china ? TAG_CHN : TAG_GFW, q, msg, raw_udp);
         } else {
-            send_group(TAG_CHN, msg, raw_udp);
-            send_group(TAG_GFW, msg, raw_udp);
+            send_group(TAG_CHN, q, msg, raw_udp);
+            send_group(TAG_GFW, q, msg, raw_udp);
         }
     } else {
-        send_group(tag, msg, raw_udp);
+        send_group(tag, q, msg, raw_udp);
     }
 }
 
@@ -1288,52 +1364,34 @@ static void cleanup_pending(void) {
         log_verbose("query qid:%u timeout", (uint)q->qid);
         query_delete(q);
     }
+    /* entries bound to a live query were just released by the query_delete
+     * calls above, so all that is left here is ageing out the orphans that a
+     * session serving the passive health-check keeps (a late reply must still
+     * be recognizable as a primary-recovery signal). entries are in send
+     * order, so `expire_at` grows along the list and the orphans due for
+     * purging are a prefix of it — the scan stops at the first entry that is
+     * still within its window instead of walking the whole list. */
     for (struct upstream_session *s = sessions; s; s = s->next) {
-        /* an entry whose query is already completed elsewhere (another upstream
-         * won the race) lingers until its own expire_at (send time + timeout)
-         * only on sessions serving the passive health-check, so a late reply
-         * can still be recognized (matched) as a primary-recovery signal; each
-         * entry ages out independently, so sustained traffic can not make old
-         * entries pile up forever. all other sessions drop such entries right
-         * away, exactly like before this feature. */
-        bool linger = session_needs_linger(s);
-        u64 oldest = 0; /* min expire_at among the lingering entries left */
+        u64 oldest = 0; /* earliest expire_at still to come; 0 = nothing left */
         if (!s->tcp) {
-            struct pending_id **p = &s->u.udp.ids;
-            while (*p) {
-                struct pending_id *id = *p;
-                if (!query_find(id->qid)) {
-                    if (linger && now < id->expire_at) {
-                        if (!oldest || id->expire_at < oldest) oldest = id->expire_at;
-                        p = &id->next;
-                    } else {
-                        *p = id->next;
-                        free(id);
-                        --s->pending_count;
-                    }
-                } else p = &id->next;
+            struct pending_id *id = s->u.udp.head;
+            while (id) {
+                struct pending_id *next = id->next;
+                if (now < id->expire_at) { oldest = id->expire_at; break; }
+                /* a live entry can only be expired if its query outlived its
+                 * own deadline, which the loop above rules out; keep it */
+                if (!id->ref.query) udp_pending_free(s, id);
+                id = next;
             }
             if (s->retired && !s->pending_count) source_detach(&s->source);
         } else {
-            struct tcp_request **p = &s->u.tcp.head;
-            while (*p) {
-                struct tcp_request *req = *p;
-                if (!query_find(req->qid)) {
-                    if (linger && now < req->expire_at) {
-                        if (!oldest || req->expire_at < oldest) oldest = req->expire_at;
-                        p = &req->next;
-                    } else {
-                        *p = req->next;
-                        free(req);
-                        --s->pending_count;
-                    }
-                } else {
-                    p = &req->next;
-                }
+            struct tcp_request *req = s->u.tcp.head;
+            while (req) {
+                struct tcp_request *next = req->next;
+                if (now < req->expire_at) { oldest = req->expire_at; break; }
+                if (!req->ref.query) tcp_request_free(s, req);
+                req = next;
             }
-            s->u.tcp.tail = NULL;
-            for (struct tcp_request *it = s->u.tcp.head; it; it = it->next)
-                s->u.tcp.tail = it;
             if (s->retired && !s->pending_count) {
                 source_detach(&s->source);
             } else if (s->u.tcp.state == TCP_DOWN && s->pending_count &&
@@ -1341,7 +1399,9 @@ static void cleanup_pending(void) {
                 tcp_start(s);
             }
         }
-        s->oldest_linger_at = oldest;
+        /* only a linger session can hold an entry past its query's deadline,
+         * so only it needs a wakeup of its own */
+        s->oldest_linger_at = session_needs_linger(s) ? oldest : 0;
     }
 }
 

@@ -834,30 +834,36 @@ def check_no_fallback_log_noise(binary):
 
 
 def check_fallback_no_amplification(binary):
-    # regression: without ?fallback, a TCP upstream must not re-send requests
-    # whose query already completed elsewhere (another upstream won the race);
-    # lingering entries and reconnect resends are fallback-group-only behavior
-    fast = MockDNS("198.51.100.7")
-    flap = FlappingTCP()
-    fast.start()
-    flap.start()
-    server = ChinaDNS(
-        binary,
-        "--default-tag", "chn",
-        "--china-dns",
-        f"udp://127.0.0.1#{fast.port}?count=0?life=0,"
-        f"tcp://127.0.0.1#{flap.port}?count=0?life=0",
-    )
-    try:
-        assert answer_ip(server.query("no-amplify.example"))[0] == "198.51.100.7"
-        # the flapping upstream sees the initial connection only; every retry
-        # attempt within the timeout window would be another accept
-        time.sleep(1.5)
-        assert flap.connections <= 2, flap.connections
-    finally:
-        server.close()
-        fast.close()
-        flap.close()
+    # regression: a TCP upstream must not re-send a request whose query already
+    # completed elsewhere (another upstream won the race). without ?fallback the
+    # request is released with the query; inside a ?fallback group it lingers as
+    # an orphan for late-reply matching, but a reconnect drops it rather than
+    # retransmitting it -- a reply can only arrive on the connection it was sent
+    # on, and while a group is unhealthy fresh queries already probe the primary
+    for extra in ([], ["udp://127.0.0.1#1?fallback"]):
+        fast = MockDNS("198.51.100.7")
+        flap = FlappingTCP()
+        fast.start()
+        flap.start()
+        upstreams = [
+            f"udp://127.0.0.1#{fast.port}?count=0?life=0",
+            f"tcp://127.0.0.1#{flap.port}?count=0?life=0",
+        ] + extra
+        server = ChinaDNS(
+            binary,
+            "--default-tag", "chn",
+            "--china-dns", ",".join(upstreams),
+        )
+        try:
+            assert answer_ip(server.query("no-amplify.example"))[0] == "198.51.100.7"
+            # the flapping upstream sees the initial connection only; every retry
+            # attempt within the timeout window would be another accept
+            time.sleep(1.5)
+            assert flap.connections <= 2, (extra, flap.connections)
+        finally:
+            server.close()
+            fast.close()
+            flap.close()
 
 
 def check_resource_exhaustion(binary):
