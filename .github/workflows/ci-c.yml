@@ -1,0 +1,100 @@
+name: ci-c
+
+on:
+  push:
+    branches:
+      - c/dev
+  pull_request:
+    branches:
+      - c/dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-c-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test Pure C development
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate development version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version=$(sed -nE 's/^#define CHINADNS_VERSION "([^"]+)".*/\1/p' src/core.h)
+          if [[ ! "$version" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-c-dev(\.[1-9][0-9]*)?$ ]]; then
+            echo "::error::invalid Pure C development version in src/core.h: '$version'" >&2
+            exit 1
+          fi
+
+          echo "chinadns-ng Pure C development version: $version"
+
+      - name: Install native build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            openssl \
+            python3
+
+      - name: Run native end-to-end tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)"
+          make check
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build representative release targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          targets='arm-linux-musleabi@generic+v5t+soft_float'
+          targets="$targets mipsel-linux-musl@mips32+soft_float"
+          targets="$targets aarch64-linux-musl@generic+v8a"
+
+          docker buildx build \
+            --target artifacts \
+            --build-arg "TARGETS=$targets" \
+            --cache-from type=gha,scope=ci-c \
+            --cache-to type=gha,mode=max,scope=ci-c \
+            --output type=local,dest=dist-smoke \
+            .
+
+      - name: Verify representative release targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binaries=$(find dist-smoke -maxdepth 1 -type f -name 'chinadns-ng*' | wc -l)
+          checksums=$(wc -l < dist-smoke/SHA256SUMS)
+
+          if [[ "$binaries" -ne 7 ]]; then
+            echo "::error::expected 7 binaries, got $binaries"
+            exit 1
+          fi
+          if [[ "$checksums" -ne 7 ]]; then
+            echo "::error::expected 7 checksums, got $checksums"
+            exit 1
+          fi
+
+          if find dist-smoke -maxdepth 1 -type f -name 'chinadns-ng*' \
+              ! -perm -u=x -print -quit | grep -q .; then
+            echo "::error::one or more release binaries are not executable" >&2
+            exit 1
+          fi
+
+          (cd dist-smoke && sha256sum --check SHA256SUMS)

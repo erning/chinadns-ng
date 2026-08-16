@@ -121,7 +121,7 @@ jobs:
               --clobber
             gh release edit "$tag" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "chinadns-ng $tag" \
+              --title "$tag" \
               --draft=false \
               --prerelease=false \
               --latest
@@ -146,6 +146,6 @@ jobs:
           gh release create "$tag" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "chinadns-ng $tag" \
+            --title "$tag" \
             --latest \
             "${notes_args[@]}"
