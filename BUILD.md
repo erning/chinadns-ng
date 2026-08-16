@@ -144,15 +144,16 @@ ZIG=/opt/zig/zig OUT=build/custom-cross \
 
 Docker 构建会：
 
-- 从固定的 Alpine 3.24.1 基础镜像的软件仓库安装 Zig；
-- 使用 Zig 作为 C 交叉编译工具链；
+- 使用与 GitHub Actions runner 一致的 Ubuntu 24.04 基础系统；
+- 按构建主机架构下载官方 Zig 0.16.0，并在解压前验证固定的 SHA-256；
+- 使用 Zig 0.16.0 作为 C 交叉编译工具链；
 - 生成静态 musl ELF，不需要目标设备提供动态 C 库；
 - 在需要时下载并按目标架构静态编译 wolfSSL；
 - 使用 Docker BuildKit 缓存 Zig、wolfSSL 源码和各目标的中间产物。
 
-需要安装 Docker，并允许构建过程访问 Alpine 软件仓库和 GitHub。构建容器可以运行在 amd64 或 arm64 Linux 环境中；主机使用 Docker Desktop 或其他 Linux 虚拟化环境也可以构建。生成的目标架构与构建环境的架构无关。
+需要安装 Docker，并允许构建过程访问 Ubuntu 软件仓库、ziglang.org 和 GitHub。构建容器可以运行在 amd64 或 arm64 Linux 环境中；主机使用 Docker Desktop 或其他 Linux 虚拟化环境也可以构建。生成的目标架构与构建环境的架构无关。
 
-Dockerfile 使用版本标签和多架构 digest 固定 Alpine 3.24.1 基础镜像。`apk add` 仍会从 Alpine 3.24 软件仓库安装当时可用的 Zig 等软件包，因此这些软件包的版本并未固定。构建日志会输出实际的 `zig version`；如果需要完全可重现的工具链，还需要固定软件包版本或使用不可变的软件仓库快照。
+Dockerfile 使用版本标签和多架构 digest 固定 Ubuntu 24.04 基础镜像，并固定 Zig 0.16.0 官方归档的下载地址和 SHA-256。`apt-get` 仍会从 Ubuntu 24.04 软件仓库安装当时可用的 autoconf、automake、libtool 等软件包，因此这些软件包的修订版本并未固定。如果需要完全可重现的工具链，还需要固定 Debian 软件包版本或使用不可变的软件仓库快照。
 
 ### 构建完整矩阵
 
@@ -334,7 +335,7 @@ chinadns-ng+wolfssl@aarch64-linux-musl@generic+v8a@fast+lto
 chinadns-ng+wolfssl_noasm@aarch64-linux-musl@generic+v8a@fast+lto
 ```
 
-大部分产物使用 `-O3 -flto`，文件名以 `@fast+lto` 结尾。已验证的 Alpine Zig 0.16 无法为 MIPS64/MIPS64el 软浮点目标完成 LTO 链接，因此下列 4 个产物使用 `-O3` 并以 `@fast` 结尾：
+大部分产物使用 `-O3 -flto`，文件名以 `@fast+lto` 结尾。已验证的 Zig 0.16.0 无法为 MIPS64/MIPS64el 软浮点目标完成 LTO 链接，因此下列 4 个产物使用 `-O3` 并以 `@fast` 结尾：
 
 - MIPS64 大端软浮点普通版和 wolfSSL 版；
 - MIPS64 小端软浮点普通版和 wolfSSL 版。
@@ -434,4 +435,4 @@ docker run --rm \
 
 #### 如何确认实际使用的 Zig 版本？
 
-Docker 镜像构建时会执行 `zig version`，版本号会出现在 `docker build` 日志中。Dockerfile 已固定 Alpine 基础镜像的版本和 digest，但 Zig 软件包版本仍由 Alpine 3.24 软件仓库决定。如果对工具链可重现性有严格要求，还需要固定 Zig 软件包版本或使用不可变的软件仓库快照。
+Docker 镜像构建时会执行 `zig version` 并断言其输出为 `0.16.0`。Dockerfile 已固定 Ubuntu 24.04 基础镜像的版本和 digest，以及 Zig 官方归档的版本和 SHA-256。Ubuntu 软件仓库提供的其他构建工具仍可能更新修订版本；如果对工具链可重现性有严格要求，还需要固定相应的软件包版本或使用不可变的软件仓库快照。

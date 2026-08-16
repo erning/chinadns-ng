@@ -11,4 +11,4 @@ if [ "${MIPS_SOFT_FP:-0}" = 1 ] && [ "${args[0]:-}" = clang ] \
     args+=("-msoft-float")
 fi
 
-exec /opt/zig_ "${args[@]}"
+exec "${ZIG_REAL:-/opt/zig/zig-real}" "${args[@]}"
