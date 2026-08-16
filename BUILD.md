@@ -16,7 +16,7 @@ chinadns-ng 使用 GNU C11，仅支持 Linux。可以在 Linux 上使用 Make �
 ## 获取源码
 
 ```bash
-git clone https://github.com/zfl9/chinadns-ng
+git clone https://github.com/erning/chinadns-ng
 cd chinadns-ng
 ```
 
@@ -144,7 +144,7 @@ ZIG=/opt/zig/zig OUT=build/custom-cross \
 
 Docker 构建会：
 
-- 从 `alpine:latest` 的软件仓库安装当前的 Zig；
+- 从固定的 Alpine 3.24.1 基础镜像的软件仓库安装 Zig；
 - 使用 Zig 作为 C 交叉编译工具链；
 - 生成静态 musl ELF，不需要目标设备提供动态 C 库；
 - 在需要时下载并按目标架构静态编译 wolfSSL；
@@ -152,7 +152,7 @@ Docker 构建会：
 
 需要安装 Docker，并允许构建过程访问 Alpine 软件仓库和 GitHub。构建容器可以运行在 amd64 或 arm64 Linux 环境中；主机使用 Docker Desktop 或其他 Linux 虚拟化环境也可以构建。生成的目标架构与构建环境的架构无关。
 
-Dockerfile 不固定 Zig 版本；每次重新获取 `alpine:latest` 时，都可能安装到更新的 Zig。构建日志会输出实际的 `zig version`。这种方式优先获取新工具链，不保证不同时间的构建完全可重现。
+Dockerfile 使用版本标签和多架构 digest 固定 Alpine 3.24.1 基础镜像。`apk add` 仍会从 Alpine 3.24 软件仓库安装当时可用的 Zig 等软件包，因此这些软件包的版本并未固定。构建日志会输出实际的 `zig version`；如果需要完全可重现的工具链，还需要固定软件包版本或使用不可变的软件仓库快照。
 
 ### 构建完整矩阵
 
@@ -434,4 +434,4 @@ docker run --rm \
 
 #### 如何确认实际使用的 Zig 版本？
 
-Docker 镜像构建时会执行 `zig version`，版本号会出现在 `docker build` 日志中。如果对工具链可重现性有严格要求，需要另行固定 Alpine 镜像 digest 和 Zig 软件包版本；当前 Dockerfile 按需求优先使用 Alpine 提供的当前版本。
+Docker 镜像构建时会执行 `zig version`，版本号会出现在 `docker build` 日志中。Dockerfile 已固定 Alpine 基础镜像的版本和 digest，但 Zig 软件包版本仍由 Alpine 3.24 软件仓库决定。如果对工具链可重现性有严格要求，还需要固定 Zig 软件包版本或使用不可变的软件仓库快照。

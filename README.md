@@ -2,6 +2,8 @@
 
 [ChinaDNS](https://github.com/shadowsocks/ChinaDNS) 的个人重构版本，功能简述：
 
+> 本仓库的 `c/master` 分支是[上游项目 zfl9/chinadns-ng](https://github.com/zfl9/chinadns-ng) 的 Pure C 维护版本。本分支的源码、问题反馈和 Release 发布于 [erning/chinadns-ng](https://github.com/erning/chinadns-ng)。
+
 - 基于 epoll、netlink(ipset/nftset) 实现，性能更强。
 - 完整支持 IPv4 和 IPv6 协议，兼容 EDNS 请求和响应。
 - 手动指定国内 DNS 和可信 DNS，而非自动识别，更加可控。
@@ -42,10 +44,10 @@
 
 ## 编译
 
-> 请前往 [releases](https://github.com/zfl9/chinadns-ng/releases) 页面下载可执行文件，添加可执行权限，放到 PATH 路径下（如 `/usr/local/bin/`）。
+> 请前往 [Releases](https://github.com/erning/chinadns-ng/releases) 页面下载 Pure C 版本的可执行文件，添加可执行权限，放到 PATH 路径下（如 `/usr/local/bin/`）。
 
 ```bash
-git clone https://github.com/zfl9/chinadns-ng
+git clone https://github.com/erning/chinadns-ng
 cd chinadns-ng
 
 # 本机构建
@@ -66,7 +68,7 @@ docker build \
 
 如果需要操作内核中的 ipset/nftset，容器必须使用相应的网络命名空间，并具有 Linux capability `NET_ADMIN`（网络管理能力）。可使用 `--cap-add NET_ADMIN`；如需操作宿主机网络命名空间中的集合，通常还需要 `--network host`。`--privileged` 也可以提供所需权限，但它会赋予容器更广泛的权限。如果不使用 ipset/nftset 功能，则无需上述网络管理权限。
 
-请前往 [releases](https://github.com/zfl9/chinadns-ng/releases) 页面下载静态可执行文件，将其复制到目标容器后运行。静态版本无需额外的动态链接库。
+请前往 [Releases](https://github.com/erning/chinadns-ng/releases) 页面下载 Pure C 版本的静态可执行文件，将其复制到目标容器后运行。静态版本无需额外的动态链接库。
 
 ## OpenWrt
 
@@ -278,7 +280,7 @@ usage: chinadns-ng <options...>. the existing options are as follows:
  -v, --verbose                        print the verbose log, default: <disabled>
  -V, --version                        print `chinadns-ng` version number and exit
  -h, --help                           print `chinadns-ng` help information and exit
-bug report: https://github.com/zfl9/chinadns-ng. email: zfl9.com@gmail.com (Otokaze)
+bug report: https://github.com/erning/chinadns-ng. email: zfl9.com@gmail.com (Otokaze)
 ```
 
 </p></details>

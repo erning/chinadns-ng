@@ -6,8 +6,8 @@
 #include <stddef.h>
 #include <sys/socket.h>
 
-#define CHINADNS_VERSION "2025.08.09-c"
-#define CHINADNS_URL "https://github.com/zfl9/chinadns-ng"
+#define CHINADNS_VERSION "2026.08.16-c"
+#define CHINADNS_URL "https://github.com/erning/chinadns-ng"
 
 struct strvec {
     char **items;

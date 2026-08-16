@@ -565,6 +565,6 @@ void config_show_help(FILE *out) {
         " -v, --verbose                        print verbose logs, default: disabled\n"
         " -V, --version                        print version and exit\n"
         " -h, --help                           print this help and exit\n"
-        "bug report: https://github.com/zfl9/chinadns-ng\n",
+        "bug report: " CHINADNS_URL "\n",
         out);
 }

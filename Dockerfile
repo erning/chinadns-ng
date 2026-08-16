@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
 # Reusable toolchain for building the complete static Linux release matrix.
-FROM alpine:latest AS base
+# Alpine 3.24.1 multi-architecture index, resolved from latest on 2026-08-16.
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS base
 
 RUN apk add --no-cache \
         autoconf automake bash binutils curl libtool make zig \
