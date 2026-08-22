@@ -558,12 +558,18 @@ def check_config_and_groups(binary):
 
         domains = os.path.join(directory, "group.txt")
         with open(domains, "w", encoding="utf-8") as file:
-            file.write("group.example\n")
+            file.write(" \t\n")
+            file.write("#" + "x" * 4096 + " full-comment.example\n")
+            file.write(" \tgroup.example \t# " + "x" * 4096 + " inline-comment.example\n")
+            file.write("first.example second.example\n")
+        default = MockDNS("192.0.2.87")
         mock = MockDNS("192.0.2.89")
+        default.start()
         mock.start()
         server = ChinaDNS(
             binary,
             "--default-tag", "chn",
+            "--china-dns", f"udp://127.0.0.1#{default.port}?count=0?life=0",
             "--group", "custom",
             "--group-dnl", domains,
             "--group-upstream", f"udp://127.0.0.1#{mock.port}?count=0?life=0",
@@ -571,8 +577,14 @@ def check_config_and_groups(binary):
         try:
             assert answer_ip(server.query("group.example"))[0] == "192.0.2.89"
             assert mock.counts["udp"] == 1, mock.counts
+            for name in ("full-comment.example", "inline-comment.example",
+                         "first.example", "second.example"):
+                assert answer_ip(server.query(name))[0] == "192.0.2.87"
+            assert default.counts["udp"] == 4, default.counts
+            assert mock.counts["udp"] == 1, mock.counts
         finally:
             server.close()
+            default.close()
             mock.close()
 
         server = ChinaDNS(

@@ -3,6 +3,7 @@
 #include "dns.h"
 #include "log.h"
 #include "uthash.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -351,9 +352,10 @@ static int s_level_max = 0;
 
 /* truncate if needed */
 static const char *check_name(const char *name) {
-    int namelen = strlen(name);
-    unlikely_if (namelen < 1 || name[0] == '.' || name[0] == '#' || name[namelen - 1] == '.')
+    size_t size = strlen(name);
+    unlikely_if (size < 1 || size > DNS_NAME_MAXLEN || name[0] == '.' || name[size - 1] == '.')
         return NULL;
+    int namelen = (int)size;
 
     int label_len = 0, level = 1;
 
@@ -409,6 +411,22 @@ static int get_suffix(const char *noalias name, int namelen, const char *noalias
 
 /* ======================== domain list ======================== */
 
+static const char *parse_list_line(char *line) {
+    char *comment = strchr(line, '#');
+    if (comment) *comment = '\0';
+
+    while (isspace((unsigned char)*line)) ++line;
+    char *end = line + strlen(line);
+    while (end > line && isspace((unsigned char)end[-1])) --end;
+    *end = '\0';
+
+    if (!*line) return NULL;
+    for (const char *p = line; *p; ++p)
+        if (isspace((unsigned char)*p)) return NULL;
+
+    return check_name(line);
+}
+
 /* return `has_domains` */
 static bool load_list(u8 tag, filenames_t filenames,
     u32 *noalias p_addr0, u32 *noalias p_count, u32 *noalias p_cost)
@@ -429,14 +447,16 @@ static bool load_list(u8 tag, filenames_t filenames,
             }
         }
 
-        char buf[DNS_NAME_MAXLEN + 1];
-        while (fscanf(fp, "%" literal(DNS_NAME_MAXLEN) "s", buf) > 0) {
-            const char *name = check_name(buf);
+        char *line = NULL;
+        size_t cap = 0;
+        while (getline(&line, &cap, fp) >= 0) {
+            const char *name = parse_list_line(line);
             if (name) {
                 u32 nameaddr = add_name(name, tag);
                 if (count++ == 0) addr0 = nameaddr;
             }
         }
+        free(line);
 
         if (fp == stdin) {
             FILE *ignored_stdin = freopen("/dev/null", "rb", stdin);
