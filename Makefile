@@ -43,6 +43,7 @@ OBJECTS := $(SOURCES:src/%.c=$(OBJECT_DIR)/%.o)
 BUILD_CONFIG := $(OBJECT_DIR)/.build-config
 TEST_OBJECTS := $(filter-out $(OBJECT_DIR)/main.o $(OBJECT_DIR)/server.o,$(OBJECTS))
 SERVER_TEST := build/tests/$(BUILD_VARIANT)/server
+CACHE_TEST := build/tests/$(BUILD_VARIANT)/cache
 
 define BUILD_CONFIG_CONTENT
 CC=$(CC)
@@ -86,8 +87,13 @@ $(SERVER_TEST): tests/server.c src/server.c $(TEST_OBJECTS) $(BUILD_CONFIG)
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(PROJECT_CFLAGS) -UNDEBUG -MMD -MP $(LDFLAGS) -o $@ $< $(TEST_OBJECTS) $(PROJECT_LDLIBS) $(LDLIBS)
 
-check-unit: $(SERVER_TEST)
+$(CACHE_TEST): tests/cache.c src/cache.c $(TEST_OBJECTS) $(BUILD_CONFIG)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(PROJECT_CFLAGS) -UNDEBUG -MMD -MP $(LDFLAGS) -o $@ $< $(filter-out $(OBJECT_DIR)/cache.o,$(TEST_OBJECTS)) $(PROJECT_LDLIBS) $(LDLIBS)
+
+check-unit: $(SERVER_TEST) $(CACHE_TEST)
 	$(SERVER_TEST)
+	$(CACHE_TEST)
 
 check: $(TARGET) check-unit
 	python3 tests/e2e.py $(TARGET)
@@ -104,3 +110,4 @@ clean:
 
 -include $(OBJECTS:.o=.d)
 -include $(SERVER_TEST).d
+-include $(CACHE_TEST).d

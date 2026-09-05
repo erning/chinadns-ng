@@ -625,6 +625,69 @@ def check_cache(binary):
         assert refresh_ttl == 0x7FFFFFFF * 20 // 100
 
 
+def check_case_insensitive(binary):
+    mock = MockDNS("192.0.2.40")
+    mock.start()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            domains = os.path.join(directory, "domains")
+            hosts = os.path.join(directory, "hosts")
+            cache_db = os.path.join(directory, "cache.db")
+            with open(domains, "w", encoding="utf-8") as file:
+                file.write("Blocked.Example\n")
+            with open(hosts, "w", encoding="utf-8") as file:
+                file.write("192.0.2.42 Mixed.Host\n")
+            args = (
+                "--default-tag", "chn", "--china-dns", f"udp://127.0.0.1#{mock.port}",
+                "--group", "null", "--group-dnl", domains,
+                "--dns-rr-ip", "Test.Local=192.0.2.41", "--hosts", hosts,
+                "--cache", "8", "--cache-db", cache_db, "--cache-ignore", "Ignore.Example",
+            )
+            server = ChinaDNS(binary, *args)
+            try:
+                for tcp in (False, True):
+                    for name in ("blocked.example", "SUB.BLOCKED.EXAMPLE"):
+                        assert_nodata(server.query(name, tcp=tcp))
+                    assert answer_ip(server.query("TEST.LOCAL", tcp=tcp))[0] == "192.0.2.41"
+                    assert answer_ip(server.query("mixed.host", tcp=tcp))[0] == "192.0.2.42"
+                assert mock.counts["udp"] == 0
+                for name in ("Mixed.Cache.Example", "mixed.cache.example", "MIXED.CACHE.EXAMPLE"):
+                    reply = server.query(name)
+                    assert answer_ip(reply)[0] == "192.0.2.40"
+                    assert reply[12:question_end(reply) - 4] == encode_name(name)
+                assert mock.counts["udp"] == 1
+                for name in ("skip.ignore.example", "SKIP.IGNORE.EXAMPLE"):
+                    server.query(name)
+                assert mock.counts["udp"] == 3
+                # Type codes 65 and 97 must not be case-folded with the name.
+                for qtype in (65, 97):
+                    server.query("types.example", qtype=qtype)
+                assert mock.counts["udp"] == 5
+            finally:
+                server.close()
+
+            # Stored hashes from older versions must not prevent a match.
+            with open(cache_db, "r+b") as file:
+                offset = 0
+                while header := file.read(24):
+                    msg_len = struct.unpack_from("=H", header, 20)[0]
+                    file.seek(offset + 8)
+                    file.write(struct.pack("=I", 0))
+                    offset += 24 + msg_len
+                    file.seek(offset)
+            mock.drop = True
+            server = ChinaDNS(binary, *args)
+            try:
+                reply = server.query("mIxEd.cAcHe.eXaMpLe")
+                assert answer_ip(reply)[0] == "192.0.2.40"
+                assert reply[12:question_end(reply) - 4] == encode_name("mIxEd.cAcHe.eXaMpLe")
+                assert mock.counts["udp"] == 5
+            finally:
+                server.close()
+    finally:
+        mock.close()
+
+
 def check_config_and_groups(binary):
     with tempfile.TemporaryDirectory() as directory:
         config = os.path.join(directory, "chinadns.conf")
@@ -1123,6 +1186,7 @@ def main():
     check_explicit_protocols(binary)
     check_reply_matching(binary)
     check_cache(binary)
+    check_case_insensitive(binary)
     check_config_and_groups(binary)
     check_rotation_and_timeout(binary)
     check_fallback(binary)

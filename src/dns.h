@@ -51,6 +51,12 @@ u16 dns_question_len(int qnamelen);
 
 /* Compare validated wire questions, ignoring ASCII case only in QNAME. */
 bool dns_question_equal(const void *question1, const void *question2, int qnamelen);
+u32 dns_question_hash(const void *question, int qnamelen);
+
+/* ASCII case folding works for both text names and validated wire names. */
+void dns_name_lower(void *name, size_t len);
+bool dns_name_equal(const void *name1, const void *name2, size_t len);
+u32 dns_name_hash(const void *name, size_t len);
 
 u16 dns_get_id(const void *noalias msg);
 

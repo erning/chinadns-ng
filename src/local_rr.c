@@ -42,13 +42,13 @@ STATIC_ASSERT(sizeof(struct rr_head) == 12);
 
 static struct rr_entry *find_entry(const void *name, size_t len, u32 hash) {
     for (struct rr_entry *e = buckets[hash & (bucket_count - 1)]; e; e = e->next)
-        if (e->hash == hash && e->name_len == len && memcmp(e->name, name, len) == 0)
+        if (e->hash == hash && e->name_len == len && dns_name_equal(e->name, name, len))
             return e;
     return NULL;
 }
 
 static struct rr_entry *get_entry(const void *name, size_t len) {
-    u32 hash = calc_hashv(name, len);
+    u32 hash = dns_name_hash(name, len);
     struct rr_entry *e = find_entry(name, len, hash);
     if (e) return e;
     if (entry_count >= bucket_count * 2) {
@@ -202,7 +202,7 @@ bool local_rr_find(const void *msg, int qnamelen,
     if (qnamelen <= 1) return false;
     const u8 *qname = (const u8 *)msg + dns_header_len();
     size_t name_len = (size_t)qnamelen - 1;
-    struct rr_entry *e = find_entry(qname, name_len, calc_hashv(qname, name_len));
+    struct rr_entry *e = find_entry(qname, name_len, dns_name_hash(qname, name_len));
     if (!e) return false;
     switch (dns_get_qtype(msg, qnamelen)) {
         case DNS_TYPE_A:

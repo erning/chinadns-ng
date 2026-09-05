@@ -82,7 +82,7 @@ static struct cache_entry *cache_find(const void *query, int qnamelen, u32 hash)
     size_t len = question_len(qnamelen);
     for (struct cache_entry *e = cache_buckets[hash & (cache_bucket_count - 1)]; e; e = e->hash_next) {
         if (e->hash == hash && question_len(e->qnamelen) == len &&
-            memcmp(question_ptr(e->msg), question, len) == 0)
+            dns_question_equal(question_ptr(e->msg), question, qnamelen))
             return e;
     }
     return NULL;
@@ -108,7 +108,7 @@ static bool cache_ignored(const void *msg, int qnamelen) {
     for (const u8 *domain = name; domain < end; domain += 1 + *domain) {
         for (struct ignored_domain *item = ignored_domains; item; item = item->next) {
             size_t len = (size_t)(end - domain);
-            if (item->len == len && memcmp(item->wire, domain, len) == 0)
+            if (item->len == len && dns_name_equal(item->wire, domain, len))
                 return true;
         }
         if (*domain == 0 || *domain > DNS_NAME_LABEL_MAXLEN) break;
@@ -140,7 +140,7 @@ struct message *cache_get(const void *query, int qnamelen,
     i32 *ttl, i32 *refresh_ttl, bool *add_ip) {
     if (!g_config.cache_size) return NULL;
     size_t len = question_len(qnamelen);
-    u32 hash = calc_hashv(question_ptr(query), len);
+    u32 hash = dns_question_hash(question_ptr(query), qnamelen);
     struct cache_entry *e = cache_find(query, qnamelen, hash);
     if (!e) return NULL;
     time_t now = time(NULL);
@@ -157,6 +157,7 @@ struct message *cache_get(const void *query, int qnamelen,
     list_remove(&e->lru);
     list_insert_after(&cache_lru, &e->lru);
     struct message *copy = message_from(e->msg, e->msg_len);
+    memcpy(copy->data + dns_header_len(), question_ptr(query), len);
     if (elapsed) dns_update_ttl(copy->data, copy->len, e->qnamelen, -elapsed);
     return copy;
 }
@@ -167,8 +168,7 @@ bool cache_add(void *reply, size_t len, int qnamelen, i32 *ttl) {
         g_config.cache_nodata_ttl, g_config.cache_min_ttl, g_config.cache_max_ttl);
     if (value <= 0) return false;
     *ttl = value;
-    size_t qlen = question_len(qnamelen);
-    u32 hash = calc_hashv(question_ptr(reply), qlen);
+    u32 hash = dns_question_hash(question_ptr(reply), qnamelen);
     struct cache_entry *old = cache_find(reply, qnamelen, hash);
     if (old) {
         i32 old_ttl = old->ttl - (i32)max((time_t)0, time(NULL) - old->update_time);
@@ -216,7 +216,8 @@ static void cache_load(void) {
         struct cache_entry *e = xmalloc(sizeof(*e) + h.msg_len);
         if (fread(e->msg, h.msg_len, 1, file) != 1) { free(e); break; }
         e->update_time = (time_t)h.update_time;
-        e->hash = h.hash;
+        /* Rehash old databases whose mixed-case questions used raw hashes. */
+        e->hash = dns_question_hash(question_ptr(e->msg), h.qnamelen);
         e->ttl = h.ttl;
         e->refresh_ttl = h.refresh_ttl;
         e->msg_len = h.msg_len;
@@ -261,13 +262,13 @@ static struct verdict_entry *verdict_find(const void *query, int qnamelen, u32 h
     const u8 *name = question_ptr(query);
     size_t len = (size_t)qnamelen - 1;
     for (struct verdict_entry *e = verdict_buckets[hash & (verdict_bucket_count - 1)]; e; e = e->hash_next)
-        if (e->hash == hash && e->name_len == len && memcmp(e->name, name, len) == 0) return e;
+        if (e->hash == hash && e->name_len == len && dns_name_equal(e->name, name, len)) return e;
     return NULL;
 }
 
 bool verdict_cache_get(const void *query, int qnamelen, bool *is_china) {
     if (!verdict_count || qnamelen <= 1) return false;
-    u32 hash = calc_hashv(question_ptr(query), (size_t)qnamelen - 1);
+    u32 hash = dns_name_hash(question_ptr(query), (size_t)qnamelen - 1);
     struct verdict_entry *e = verdict_find(query, qnamelen, hash);
     if (!e) return false;
     *is_china = e->is_china;
@@ -287,7 +288,7 @@ static void verdict_remove(struct verdict_entry *e) {
 void verdict_cache_add(const void *query, int qnamelen, bool is_china) {
     if (!g_config.verdict_cache_size || qnamelen <= 1) return;
     size_t len = (size_t)qnamelen - 1;
-    u32 hash = calc_hashv(question_ptr(query), len);
+    u32 hash = dns_name_hash(question_ptr(query), len);
     struct verdict_entry *e = verdict_find(query, qnamelen, hash);
     if (e) { e->is_china = is_china; return; }
     while (verdict_count >= g_config.verdict_cache_size && !list_empty(&verdict_fifo))

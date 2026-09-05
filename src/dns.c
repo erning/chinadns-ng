@@ -263,15 +263,43 @@ u16 dns_question_len(int qnamelen) {
     return qnamelen + sizeof(struct dns_question);
 }
 
+static u8 ascii_lower(u8 c) {
+    return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+}
+
+void dns_name_lower(void *name, size_t len) {
+    u8 *bytes = name;
+    for (size_t i = 0; i < len; ++i) bytes[i] = ascii_lower(bytes[i]);
+}
+
+bool dns_name_equal(const void *name1, const void *name2, size_t len) {
+    const u8 *a = name1, *b = name2;
+    for (size_t i = 0; i < len; ++i)
+        if (ascii_lower(a[i]) != ascii_lower(b[i])) return false;
+    return true;
+}
+
+u32 dns_name_hash(const void *name, size_t len) {
+    u8 normalized[DNS_NAME_WIRE_MAXLEN];
+    assert(len <= sizeof(normalized));
+    memcpy(normalized, name, len);
+    dns_name_lower(normalized, len);
+    return calc_hashv(normalized, len);
+}
+
 bool dns_question_equal(const void *question1, const void *question2, int qnamelen) {
     const u8 *a = question1, *b = question2;
-    for (int i = 0; i < qnamelen; ++i) {
-        u8 x = a[i], y = b[i];
-        if (x >= 'A' && x <= 'Z') x += 'a' - 'A';
-        if (y >= 'A' && y <= 'Z') y += 'a' - 'A';
-        if (x != y) return false;
-    }
-    return memcmp(a + qnamelen, b + qnamelen, sizeof(struct dns_question)) == 0;
+    return dns_name_equal(a, b, qnamelen) &&
+        memcmp(a + qnamelen, b + qnamelen, sizeof(struct dns_question)) == 0;
+}
+
+u32 dns_question_hash(const void *question, int qnamelen) {
+    u8 normalized[DNS_NAME_WIRE_MAXLEN + sizeof(struct dns_question)];
+    size_t len = dns_question_len(qnamelen);
+    assert(len <= sizeof(normalized));
+    memcpy(normalized, question, len);
+    dns_name_lower(normalized, qnamelen);
+    return calc_hashv(normalized, len);
 }
 
 u16 dns_get_id(const void *noalias msg) {

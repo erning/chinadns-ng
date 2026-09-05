@@ -424,6 +424,7 @@ static const char *parse_list_line(char *line) {
     for (const char *p = line; *p; ++p)
         if (isspace((unsigned char)*p)) return NULL;
 
+    dns_name_lower(line, end - line);
     return check_name(line);
 }
 
@@ -585,10 +586,15 @@ u8 dnl_get_tag(const char *noalias name, int namelen, u8 default_tag) {
     assert(namelen > 0);
     assert((u8)namelen == namelen);
 
+    char normalized[DNS_NAME_MAXLEN];
+    assert((size_t)namelen <= sizeof(normalized));
+    memcpy(normalized, name, namelen);
+    dns_name_lower(normalized, namelen);
+
     const char *noalias suffix_array[MAX_NAME_LEVEL];
     int suffixlen_array[MAX_NAME_LEVEL];
 
-    int n = get_suffix(name, namelen, suffix_array, suffixlen_array);
+    int n = get_suffix(normalized, namelen, suffix_array, suffixlen_array);
 
     // for (int i = 0; i < n; ++i)
     //     log_warning("suffix[%d] = '%.*s'", i, suffixlen_array[i], suffix_array[i]);
