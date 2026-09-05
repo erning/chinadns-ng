@@ -263,6 +263,17 @@ u16 dns_question_len(int qnamelen) {
     return qnamelen + sizeof(struct dns_question);
 }
 
+bool dns_question_equal(const void *question1, const void *question2, int qnamelen) {
+    const u8 *a = question1, *b = question2;
+    for (int i = 0; i < qnamelen; ++i) {
+        u8 x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x += 'a' - 'A';
+        if (y >= 'A' && y <= 'Z') y += 'a' - 'A';
+        if (x != y) return false;
+    }
+    return memcmp(a + qnamelen, b + qnamelen, sizeof(struct dns_question)) == 0;
+}
+
 u16 dns_get_id(const void *noalias msg) {
     return cast(const struct dns_header *, msg)->id;
 }

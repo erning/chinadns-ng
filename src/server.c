@@ -89,6 +89,8 @@ struct query_ref {
     struct query_ref *q_next; /* next entry of the same query */
     struct query *query;
     struct upstream_session *session;
+    const u8 *question;
+    u8 qnamelen;
 };
 
 struct query {
@@ -118,6 +120,7 @@ struct pending_id {
     struct query_ref ref;
     u16 qid;
     u64 expire_at; /* monotime(ms) after which a lingering entry is purged */
+    u8 question[];
 };
 
 struct tcp_request {
@@ -520,12 +523,16 @@ static void session_mark_retired(struct upstream_session *s) {
     if (!s->pending_count) source_detach(&s->source);
 }
 
-static void udp_pending_add(struct upstream_session *s, struct query *q, u16 qid) {
-    struct pending_id *id = xcalloc(1, sizeof(*id));
-    id->qid = qid;
+static void udp_pending_add(struct upstream_session *s, struct query *q, struct message *msg) {
+    size_t question_len = dns_question_len(q->qnamelen);
+    struct pending_id *id = xcalloc(1, sizeof(*id) + question_len);
+    id->qid = q->qid;
     id->expire_at = now_msec() + (u64)g_config.upstream_timeout * 1000;
     id->ref.session = s;
     id->ref.query = q;
+    id->ref.qnamelen = q->qnamelen;
+    id->ref.question = id->question;
+    memcpy(id->question, msg->data + dns_header_len(), question_len);
     id->ref.q_next = q->refs;
     q->refs = &id->ref;
     /* appended, so the list stays ordered by expire_at */
@@ -536,12 +543,18 @@ static void udp_pending_add(struct upstream_session *s, struct query *q, u16 qid
     ++s->pending_count;
 }
 
-static bool udp_pending_remove(struct upstream_session *s, u16 qid) {
-    /* newest first: if a lingering orphan shares the qid with a fresh entry
-     * (query_new only avoids ids of live queries), the fresh one wins */
+static bool query_ref_matches(const struct query_ref *ref, const void *reply, int qnamelen) {
+    return ref->qnamelen == qnamelen && dns_question_equal(ref->question,
+        (const u8 *)reply + dns_header_len(), qnamelen);
+}
+
+static bool udp_pending_remove(struct upstream_session *s, u16 qid,
+    const void *reply, int qnamelen, struct query **query) {
+    /* Prefer the newest entry with an equivalent question after ID reuse. */
     struct pending_id *id = s->u.udp.tail;
-    while (id && id->qid != qid) id = id->prev;
+    while (id && (id->qid != qid || !query_ref_matches(&id->ref, reply, qnamelen))) id = id->prev;
     if (!id) return false;
+    *query = id->ref.query;
     query_ref_release(&id->ref);
     udp_pending_free(s, id);
     if (s->retired && !s->pending_count) source_detach(&s->source);
@@ -582,11 +595,14 @@ static void udp_session_read(struct upstream_session *s) {
 
 /* remove the request of qmsg; returns whether the reply matched one of this
  * session's outstanding queries (gates the passive health-check recovery) */
-static bool tcp_request_remove(struct upstream_session *s, u16 qid) {
+static bool tcp_request_remove(struct upstream_session *s, u16 qid,
+    const void *reply, int qnamelen, struct query **query) {
     /* newest first, see udp_pending_remove */
     struct tcp_request *req = s->u.tcp.tail;
-    while (req && req->qid != qid) req = req->prev;
+    while (req && (req->qid != qid || !req->sent ||
+        !query_ref_matches(&req->ref, reply, qnamelen))) req = req->prev;
     if (!req) return false;
+    *query = req->ref.query;
     query_ref_release(&req->ref);
     tcp_request_free(s, req);
     return true;
@@ -596,11 +612,12 @@ static bool tcp_request_remove(struct upstream_session *s, u16 qid) {
  * this session's outstanding queries. called from upstream_on_reply only
  * after the reply passed validation, so a malformed reply does not consume
  * the entry (and thus cannot silence a later real reply).
- * note: a lingering entry's qid can be reused by a new query (query_new only
- * avoids ids of live queries); the newest matching entry is consumed first,
- * so the fresh query wins and only the stale orphan can be skewed. */
-static bool session_pending_remove(struct upstream_session *s, u16 qid) {
-    return s->tcp ? tcp_request_remove(s, qid) : udp_pending_remove(s, qid);
+ * Return the entry's owning query, which is NULL for lingering orphans;
+ * never associate an orphan's reply with a new query that reused its ID. */
+static bool session_pending_remove(struct upstream_session *s, u16 qid,
+    const void *reply, int qnamelen, struct query **query) {
+    return s->tcp ? tcp_request_remove(s, qid, reply, qnamelen, query) :
+        udp_pending_remove(s, qid, reply, qnamelen, query);
 }
 
 static void tcp_reset_input(struct upstream_session *s) {
@@ -969,7 +986,7 @@ static void session_send(struct upstream_config *config, struct query *q, struct
             if (n == msg->len) any = true;
             else if (n < 0) log_warning("send(%s) failed: (%d) %s", config->url, errno, strerror(errno));
         }
-        if (any) udp_pending_add(s, q, qid);
+        if (any) udp_pending_add(s, q, msg);
     } else {
         size_t frame_len = 2 + msg->len;
         struct tcp_request *req = xcalloc(1, sizeof(*req) + frame_len);
@@ -981,6 +998,8 @@ static void session_send(struct upstream_config *config, struct query *q, struct
         memcpy(req->frame + 2, msg->data, msg->len);
         req->ref.session = s;
         req->ref.query = q;
+        req->ref.qnamelen = q->qnamelen;
+        req->ref.question = req->frame + 2 + dns_header_len();
         req->ref.q_next = q->refs;
         q->refs = &req->ref;
         req->prev = s->u.tcp.tail;
@@ -1137,7 +1156,9 @@ static void upstream_on_reply(struct upstream_session *session, struct message *
 
     /* consume the pending entry only now, after the reply passed validation:
      * `matched` = the reply answers one of this session's outstanding queries */
-    bool matched = session_pending_remove(session, qid);
+    struct query *q = NULL;
+    bool matched = session_pending_remove(session, qid, reply->data, qnamelen, &q);
+    if (!matched) return;
 
     /* passive health-check: a good reply (rcode noerror/nxdomain, not truncated)
      * that actually answers one of this primary (non-fallback) upstream's
@@ -1151,7 +1172,6 @@ static void upstream_on_reply(struct upstream_session *session, struct message *
     if (matched && !session->config->fallback && dns_is_good(reply->data))
         group_primary_alive(session->config->tag);
 
-    struct query *q = query_find(qid);
     if (!q) return;
     dns_set_id(reply->data, q->original_id);
     if (q->from != QUERY_UDP && dns_is_tc(reply->data)) return;

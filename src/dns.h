@@ -49,6 +49,9 @@ u16 dns_header_len(void);
 
 u16 dns_question_len(int qnamelen);
 
+/* Compare validated wire questions, ignoring ASCII case only in QNAME. */
+bool dns_question_equal(const void *question1, const void *question2, int qnamelen);
+
 u16 dns_get_id(const void *noalias msg);
 
 void dns_set_id(void *noalias msg, u16 id);

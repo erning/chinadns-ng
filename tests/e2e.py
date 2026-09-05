@@ -181,6 +181,27 @@ class FlappingTCP:
             conn.close()
 
 
+class MismatchedDNS(MockDNS):
+    def __init__(self):
+        super().__init__("192.0.2.77", mangle=True)
+
+    def mangled_reply(self, query, sock, peer=None):
+        ident = struct.unpack_from("!H", query)[0]
+        wrong_name = make_query("wrong.example", 1, ident)
+        wrong_type = bytearray(query)
+        struct.pack_into("!H", wrong_type, question_end(query) - 4, 28)
+        wrong_class = bytearray(query)
+        struct.pack_into("!H", wrong_class, question_end(query) - 2, 3)
+        valid = bytearray(query)
+        valid[12:question_end(query) - 4] = valid[12:question_end(query) - 4].upper()
+        for question in (wrong_name, wrong_type, wrong_class, valid):
+            reply = make_answer(question, self.address if question is valid else "192.0.2.66")
+            if peer is None:
+                sock.sendall(struct.pack("!H", len(reply)) + reply)
+            else:
+                sock.sendto(reply, peer)
+
+
 class MockDoT:
     def __init__(self, address):
         self.address = address
@@ -490,6 +511,64 @@ def check_explicit_protocols(binary):
     finally:
         udp_server.close()
         udp_mock.close()
+
+
+def check_reply_matching(binary):
+    mock = MismatchedDNS()
+    mock.start()
+    try:
+        for protocol in ("udp", "tcp"):
+            server = ChinaDNS(
+                binary, "--default-tag", "chn", "--cache", "8",
+                "--china-dns", f"{protocol}://127.0.0.1#{mock.port}?count=0?life=0",
+            )
+            try:
+                reply = server.query("right.example")
+                assert answer_ip(reply)[0] == "192.0.2.77"
+                assert reply[12:question_end(reply) - 4] == encode_name("RIGHT.EXAMPLE")
+                assert struct.unpack_from("!HH", reply, question_end(reply) - 4) == (1, 1)
+            finally:
+                server.close()
+    finally:
+        mock.close()
+
+    # A valid response from a configured but unrelated session must not
+    # consume the query owned by the other group.
+    with tempfile.TemporaryDirectory() as directory, \
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as first, \
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as second, \
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        for sock in (first, second, client):
+            sock.bind(("127.0.0.1", 0))
+            sock.settimeout(2)
+        domains = os.path.join(directory, "domains")
+        with open(domains, "w", encoding="utf-8") as file:
+            file.write("pending.example\n")
+        server = ChinaDNS(
+            binary, "--default-tag", "chn", "--gfwlist-file", domains,
+            "--china-dns", f"udp://127.0.0.1#{first.getsockname()[1]}?count=0?life=0",
+            "--trust-dns", f"udp://127.0.0.1#{second.getsockname()[1]}?count=0?life=0",
+        )
+        try:
+            target = ("127.0.0.1", server.port)
+            client.sendto(make_query("warm.example", 1, 1), target)
+            query, first_peer = first.recvfrom(4096)
+            first.sendto(make_answer(query, "192.0.2.1"), first_peer)
+            client.recv(4096)
+            client.sendto(make_query("pending.example", 1, 2), target)
+            query, second_peer = second.recvfrom(4096)
+            first.sendto(make_answer(query, "192.0.2.66"), first_peer)
+            client.settimeout(0.1)
+            try:
+                client.recv(4096)
+                raise AssertionError("accepted response from an unrelated session")
+            except TimeoutError:
+                pass
+            second.sendto(make_answer(query, "192.0.2.77"), second_peer)
+            client.settimeout(2)
+            assert answer_ip(client.recv(4096))[0] == "192.0.2.77"
+        finally:
+            server.close()
 
 
 def check_cache(binary):
@@ -1042,6 +1121,7 @@ def main():
     check_root_query(binary)
     check_raw_upstream(binary)
     check_explicit_protocols(binary)
+    check_reply_matching(binary)
     check_cache(binary)
     check_config_and_groups(binary)
     check_rotation_and_timeout(binary)
