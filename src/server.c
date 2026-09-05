@@ -104,6 +104,7 @@ struct query {
     u16 qtype;
     u8 tag;
     u8 qnamelen;
+    bool cacheable;
     enum query_from from;
     enum query_verdict verdict;
     struct listener *udp_listener;
@@ -1102,9 +1103,12 @@ static void handle_query(struct message *msg, enum query_from from,
     }
 
     bool raw_udp = from == QUERY_UDP;
+    /* Neither response nor verdict keys include an ECS subnet. */
+    bool cacheable = dns_ecs_status(msg->data, msg->len, qnamelen) == 0;
     i32 ttl, refresh_ttl;
     bool add_ip;
-    struct message *cached = cache_get(msg->data, qnamelen, &ttl, &refresh_ttl, &add_ip);
+    struct message *cached = cacheable ?
+        cache_get(msg->data, qnamelen, &ttl, &refresh_ttl, &add_ip) : NULL;
     if (cached) {
         if (add_ip && tag != TAG_NONE && (qtype == DNS_TYPE_A || qtype == DNS_TYPE_AAAA) && ip_addctx[tag])
             dns_add_ip(cached->data, cached->len, qnamelen, ip_addctx[tag]);
@@ -1124,9 +1128,10 @@ static void handle_query(struct message *msg, enum query_from from,
     struct query *q = query_new(msg, qnamelen, qtype, tag, bufsz, from,
         udp_listener, peer, tcp_client);
     if (!q) return;
+    q->cacheable = cacheable;
     if (tag == TAG_NONE) {
         bool is_china;
-        if (verdict_cache_get(msg->data, qnamelen, &is_china)) {
+        if (cacheable && verdict_cache_get(msg->data, qnamelen, &is_china)) {
             q->verdict = is_china ? VERDICT_CHINA : VERDICT_NON_CHINA;
             send_group(is_china ? TAG_CHN : TAG_GFW, q, msg, raw_udp);
         } else {
@@ -1138,11 +1143,12 @@ static void handle_query(struct message *msg, enum query_from from,
     }
 }
 
-static bool use_china_reply(struct message *msg, int qnamelen, int *test_result) {
+static bool use_china_reply(struct message *msg, int qnamelen, bool cacheable, int *test_result) {
     *test_result = dns_test_ip(msg->data, msg->len, qnamelen, ip_testctx);
     if (*test_result == DNS_TEST_IP_IS_CHINA_IP || *test_result == DNS_TEST_IP_NON_CHINA_IP) {
         bool china = *test_result == DNS_TEST_IP_IS_CHINA_IP;
-        verdict_cache_add(msg->data, qnamelen, china);
+        if (cacheable && dns_ecs_status(msg->data, msg->len, qnamelen) == 0)
+            verdict_cache_add(msg->data, qnamelen, china);
         return china;
     }
     if (*test_result == DNS_TEST_IP_NO_IP_FOUND) return g_config.noip_as_chnip;
@@ -1189,7 +1195,8 @@ static void upstream_on_reply(struct upstream_session *session, struct message *
 
     if (q->tag == TAG_NONE && address_query) {
         if (session->config->tag == TAG_CHN) {
-            if (q->verdict == VERDICT_CHINA || use_china_reply(reply, qnamelen, &test_result)) {
+            if (q->verdict == VERDICT_CHINA ||
+                use_china_reply(reply, qnamelen, q->cacheable, &test_result)) {
                 log_verbose("accept qid:%u from %s", (uint)qid, session->config->url);
             } else if (q->trust_reply) {
                 selected = q->trust_reply;
@@ -1217,7 +1224,7 @@ static void upstream_on_reply(struct upstream_session *session, struct message *
         dns_add_ip(selected->data, selected->len, qnamelen, ip_addctx[q->tag]);
 
     i32 ttl;
-    cache_add(selected->data, selected->len, qnamelen, &ttl);
+    if (q->cacheable) cache_add(selected->data, selected->len, qnamelen, &ttl);
     send_reply_to_query(q, selected);
     query_delete(q);
 }

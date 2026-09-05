@@ -358,6 +358,36 @@ u16 dns_get_bufsz(const void *noalias msg, ssize_t len, int qnamelen) {
     return bufsz;
 }
 
+static bool check_ecs(struct dns_record *record, int rnamelen, void *ud, bool *is_break) {
+    (void)rnamelen;
+    (void)is_break;
+    if (ntohs(record->rtype) != DNS_TYPE_OPT) return true;
+    const u8 *option = (const u8 *)record->rdata;
+    size_t remain = ntohs(record->rdatalen);
+    while (remain) {
+        if (remain < 4) return false;
+        u16 code = ((u16)option[0] << 8) | option[1];
+        size_t size = ((u16)option[2] << 8) | option[3];
+        if (size > remain - 4) return false;
+        if (code == 8) *(bool *)ud = true;
+        option += 4 + size;
+        remain -= 4 + size;
+    }
+    return true;
+}
+
+int dns_ecs_status(const void *msg, ssize_t len, int qnamelen) {
+    int additional_count = get_additional_count(msg);
+    if (!additional_count) return 0;
+    int preceding = get_answer_count(msg) + get_authority_count(msg);
+    move_to_records(msg, len, qnamelen);
+    bool found = false;
+    if (!skip_record((void **)&msg, &len, preceding) ||
+        !foreach_record((void **)&msg, &len, additional_count, check_ecs, &found) || len != 0)
+        return -1;
+    return found ? 1 : 0;
+}
+
 u8 dns_get_rcode(const void *noalias msg) {
     return cast(const struct dns_header *, msg)->rcode;
 }
@@ -402,6 +432,11 @@ u16 dns_empty_reply(void *noalias msg, int qnamelen) {
 static u16 rm_additional(void *noalias msg, ssize_t len, int qnamelen) {
     if (!dns_is_good(msg))
         return len;
+
+    int ecs = dns_ecs_status(msg, len, qnamelen);
+    if (ecs < 0) return 0;
+    /* ECS responses must retain the subnet and scope supplied by upstream. */
+    if (ecs > 0) return len;
 
     void *start = msg;
 

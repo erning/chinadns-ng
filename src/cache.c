@@ -164,6 +164,7 @@ struct message *cache_get(const void *query, int qnamelen,
 
 bool cache_add(void *reply, size_t len, int qnamelen, i32 *ttl) {
     if (!g_config.cache_size || !dns_is_good(reply) || cache_ignored(reply, qnamelen)) return false;
+    if (dns_ecs_status(reply, (ssize_t)len, qnamelen) != 0) return false;
     i32 value = dns_get_ttl(reply, (ssize_t)len, qnamelen,
         g_config.cache_nodata_ttl, g_config.cache_min_ttl, g_config.cache_max_ttl);
     if (value <= 0) return false;

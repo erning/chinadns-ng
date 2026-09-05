@@ -67,6 +67,9 @@ u16 dns_get_qtype(const void *noalias msg, int qnamelen);
 /* get the peer's udp receive buffer size from the `OPT RR` */
 u16 dns_get_bufsz(const void *noalias msg, ssize_t len, int qnamelen);
 
+/* 1: EDNS Client Subnet present, 0: absent, -1: malformed additional data. */
+int dns_ecs_status(const void *msg, ssize_t len, int qnamelen);
+
 u8 dns_get_rcode(const void *noalias msg);
 
 bool dns_is_tc(const void *noalias msg);

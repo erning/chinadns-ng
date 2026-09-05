@@ -30,6 +30,18 @@ def make_query(name, qtype, ident):
     return struct.pack("!HHHHHH", ident, 0x0100, 1, 0, 0, 0) + encode_name(name) + struct.pack("!HH", qtype, 1)
 
 
+def add_ecs(query, subnet):
+    network = ipaddress.ip_network(subnet)
+    address = network.network_address.packed[:(network.prefixlen + 7) // 8]
+    payload = struct.pack("!HBB", 1 if network.version == 4 else 2, network.prefixlen, 0) + address
+    options = struct.pack("!HH", 12, 2) + bytes(2)
+    options += struct.pack("!HH", 8, len(payload)) + payload
+    options += struct.pack("!HH", 12, 3) + bytes(3)
+    result = bytearray(query)
+    struct.pack_into("!H", result, 10, 1)
+    return bytes(result) + b"\0" + struct.pack("!HHIH", 41, 1232, 0, len(options)) + options
+
+
 def question_end(message):
     pos = 12
     while message[pos]:
@@ -202,6 +214,34 @@ class MismatchedDNS(MockDNS):
                 sock.sendto(reply, peer)
 
 
+class SubnetDNS(MockDNS):
+    def __init__(self):
+        super().__init__("203.0.113.1", mangle=True)
+        self.echo_ecs = True
+
+    def mangled_reply(self, query, sock, peer=None):
+        additional = bytearray(query[question_end(query):])
+        address = self.address
+        if additional:
+            pos = 11
+            while pos < len(additional):
+                code, size = struct.unpack_from("!HH", additional, pos)
+                if code == 8:
+                    family = struct.unpack_from("!H", additional, pos + 4)[0]
+                    address = "192.0.2.30" if family == 2 else (
+                        "192.0.2.10" if additional[pos + 8] == 192 else "192.0.2.20")
+                    additional[pos + 7] = additional[pos + 6]
+                pos += 4 + size
+        reply = bytearray(make_answer(query, address))
+        if additional and self.echo_ecs:
+            struct.pack_into("!H", reply, 10, 1)
+            reply += additional
+        if peer is None:
+            sock.sendall(struct.pack("!H", len(reply)) + reply)
+        else:
+            sock.sendto(reply, peer)
+
+
 class MockDoT:
     def __init__(self, address):
         self.address = address
@@ -324,6 +364,9 @@ class ChinaDNS:
 
     def query(self, name, qtype=1, tcp=False, ident=0x1234):
         query = make_query(name, qtype, ident)
+        return self.query_message(query, tcp)
+
+    def query_message(self, query, tcp=False):
         if tcp:
             sock = socket.create_connection(("127.0.0.1", self.port), timeout=2)
             with sock:
@@ -682,6 +725,47 @@ def check_case_insensitive(binary):
                 assert answer_ip(reply)[0] == "192.0.2.40"
                 assert reply[12:question_end(reply) - 4] == encode_name("mIxEd.cAcHe.eXaMpLe")
                 assert mock.counts["udp"] == 5
+            finally:
+                server.close()
+    finally:
+        mock.close()
+
+
+def check_ecs_cache(binary):
+    mock = SubnetDNS()
+    mock.start()
+    try:
+        for protocol in ("udp", "tcp"):
+            server = ChinaDNS(
+                binary, "--default-tag", "chn", "--cache", "8",
+                "--china-dns", f"{protocol}://127.0.0.1#{mock.port}?count=0?life=0",
+            )
+            try:
+                before = mock.counts[protocol]
+                assert answer_ip(server.query("ecs.example"))[0] == mock.address
+                for tcp in (False, True):
+                    for subnet, expected in (("192.0.2.0/24", "192.0.2.10"),
+                                             ("198.51.100.0/24", "192.0.2.20"),
+                                             ("2001:db8:1::/56", "192.0.2.30")):
+                        query = add_ecs(make_query("ecs.example", 1, 0x1234), subnet)
+                        reply = server.query_message(query, tcp=tcp)
+                        assert answer_ip(reply)[0] == expected
+                        assert struct.unpack_from("!H", reply, 10)[0] == 1
+                        expected_opt = bytearray(query[question_end(query):])
+                        expected_opt[24] = expected_opt[23]  # ECS scope = source prefix
+                        assert reply[question_end(reply) + 16:] == expected_opt
+                assert mock.counts[protocol] == before + 7
+                assert answer_ip(server.query("ecs.example"))[0] == mock.address
+                assert mock.counts[protocol] == before + 7
+
+                # An upstream omitting ECS must not make its tailored answer
+                # cacheable just because its response no longer has an OPT RR.
+                mock.echo_ecs = False
+                query = add_ecs(make_query("omitted.example", 1, 1), "192.0.2.0/24")
+                assert answer_ip(server.query_message(query))[0] == "192.0.2.10"
+                assert answer_ip(server.query("omitted.example"))[0] == mock.address
+                assert mock.counts[protocol] == before + 9
+                mock.echo_ecs = True
             finally:
                 server.close()
     finally:
@@ -1187,6 +1271,7 @@ def main():
     check_reply_matching(binary)
     check_cache(binary)
     check_case_insensitive(binary)
+    check_ecs_cache(binary)
     check_config_and_groups(binary)
     check_rotation_and_timeout(binary)
     check_fallback(binary)
