@@ -41,6 +41,8 @@ SOURCES := \
 OBJECT_DIR := build/obj/$(BUILD_VARIANT)
 OBJECTS := $(SOURCES:src/%.c=$(OBJECT_DIR)/%.o)
 BUILD_CONFIG := $(OBJECT_DIR)/.build-config
+TEST_OBJECTS := $(filter-out $(OBJECT_DIR)/main.o $(OBJECT_DIR)/server.o,$(OBJECTS))
+SERVER_TEST := build/tests/$(BUILD_VARIANT)/server
 
 define BUILD_CONFIG_CONTENT
 CC=$(CC)
@@ -53,7 +55,7 @@ PROJECT_LDLIBS=$(PROJECT_LDLIBS)
 LDLIBS=$(LDLIBS)
 endef
 
-.PHONY: all clean check check-wolfssl check-ipset FORCE
+.PHONY: all clean check check-unit check-wolfssl check-ipset FORCE
 
 all: $(TARGET)
 
@@ -80,7 +82,14 @@ $(OBJECT_DIR)/%.o: src/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(PROJECT_CFLAGS) -MMD -MP -c -o $@ $<
 
-check: $(TARGET)
+$(SERVER_TEST): tests/server.c src/server.c $(TEST_OBJECTS) $(BUILD_CONFIG)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(PROJECT_CFLAGS) -UNDEBUG -MMD -MP $(LDFLAGS) -o $@ $< $(TEST_OBJECTS) $(PROJECT_LDLIBS) $(LDLIBS)
+
+check-unit: $(SERVER_TEST)
+	$(SERVER_TEST)
+
+check: $(TARGET) check-unit
 	python3 tests/e2e.py $(TARGET)
 
 check-wolfssl:
@@ -94,3 +103,4 @@ clean:
 	rm -rf build
 
 -include $(OBJECTS:.o=.d)
+-include $(SERVER_TEST).d

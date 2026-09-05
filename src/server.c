@@ -132,6 +132,7 @@ struct tcp_request {
     u16 qid;
     u64 expire_at; /* monotime(ms) after which a lingering entry is purged */
     bool sent;
+    bool write_started; /* TLS may buffer bytes even when offset is still zero */
     u8 frame[];
 };
 
@@ -391,26 +392,29 @@ static void tcp_request_free(struct upstream_session *s, struct tcp_request *req
     --s->pending_count;
 }
 
-/* release every session entry sent for this query: a session serving the
- * passive health-check keeps its entry as an orphan (a late reply must still
- * match, as a recovery signal) until cleanup_pending ages it out; every other
- * session drops it right away, so nothing has to scan for orphans later. */
+static void tcp_disconnect(struct upstream_session *s, bool retry);
+static void tcp_update_events(struct upstream_session *s);
+
+/* Only fully sent requests can linger for a late health-check reply. Never
+ * discard a partial frame while keeping its byte stream open. */
 static void query_release_refs(struct query *q) {
-    struct query_ref *ref = q->refs;
-    q->refs = NULL;
-    while (ref) {
-        struct query_ref *next = ref->q_next;
+    while (q->refs) {
+        struct query_ref *ref = q->refs;
         struct upstream_session *s = ref->session;
-        ref->query = NULL;
-        ref->q_next = NULL;
-        if (!session_needs_linger(s)) {
-            if (s->tcp)
-                tcp_request_free(s, container_of(ref, struct tcp_request, ref));
-            else
-                udp_pending_free(s, container_of(ref, struct pending_id, ref));
-            if (s->retired && !s->pending_count) source_detach(&s->source);
+        query_ref_release(ref);
+        if (s->tcp) {
+            struct tcp_request *req = container_of(ref, struct tcp_request, ref);
+            if (!req->sent && req->write_started) {
+                /* Drops this orphan and resets live requests for reconnect. */
+                tcp_disconnect(s, true);
+            } else if (!req->sent || !session_needs_linger(s)) {
+                tcp_request_free(s, req);
+                tcp_update_events(s);
+            }
+        } else if (!session_needs_linger(s)) {
+            udp_pending_free(s, container_of(ref, struct pending_id, ref));
         }
-        ref = next;
+        if (s->retired && !s->pending_count) source_detach(&s->source);
     }
 }
 
@@ -659,6 +663,7 @@ static void tcp_disconnect(struct upstream_session *s, bool retry) {
         if (req->ref.query) {
             req->offset = 0;
             req->sent = false;
+            req->write_started = false;
         } else {
             tcp_request_free(s, req);
         }
@@ -824,6 +829,7 @@ static void tcp_session_write(struct upstream_session *s) {
     for (struct tcp_request *req = s->u.tcp.head; req; req = req->next) {
         if (req->sent) continue;
         ssize_t n;
+        req->write_started = true;
         do {
             n = tcp_write_data(s, req->frame + req->offset, req->frame_len - req->offset);
         } while (n == -1 && errno == EINTR);
