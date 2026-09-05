@@ -21,6 +21,8 @@ def free_port():
 
 
 def encode_name(name):
+    if name == ".":
+        return b"\0"
     return b"".join(bytes([len(label)]) + label.encode() for label in name.split(".")) + b"\0"
 
 
@@ -408,6 +410,32 @@ def check_local(binary):
             raise AssertionError("oversized local RR set unexpectedly started")
         except RuntimeError as error:
             assert "too many local A records for huge.local" in str(error), error
+
+
+def check_root_query(binary):
+    mock = MockDNS("192.0.2.2")
+    mock.start()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            domains = os.path.join(directory, "domains")
+            with open(domains, "w", encoding="utf-8") as file:
+                file.write("blocked.example\n")
+            server = ChinaDNS(
+                binary, "--default-tag", "chn",
+                "--china-dns", f"127.0.0.1#{mock.port}",
+                "--group", "null", "--group-dnl", domains,
+            )
+            try:
+                for tcp in (False, True):
+                    reply = server.query(".", tcp=tcp, ident=0x5678)
+                    assert answer_ip(reply)[0] == "192.0.2.2"
+                    assert struct.unpack_from("!H", reply)[0] == 0x5678
+                    assert_nodata(server.query("blocked.example", tcp=tcp))
+                assert mock.counts == {"udp": 1, "tcp": 1}, mock.counts
+            finally:
+                server.close()
+    finally:
+        mock.close()
 
 
 def check_raw_upstream(binary):
@@ -1011,6 +1039,7 @@ def check_dot(binary):
 def main():
     binary = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "build/chinadns-ng")
     check_local(binary)
+    check_root_query(binary)
     check_raw_upstream(binary)
     check_explicit_protocols(binary)
     check_cache(binary)

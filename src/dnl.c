@@ -580,6 +580,8 @@ bool dnl_is_empty(void) {
 u8 dnl_get_tag(const char *noalias name, int namelen, u8 default_tag) {
     assert(!dnl_is_null());
 
+    /* The root has no suffix to match against a domain list. */
+    if (namelen == 0) return default_tag;
     assert(namelen > 0);
     assert((u8)namelen == namelen);
 
