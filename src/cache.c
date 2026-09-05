@@ -133,7 +133,7 @@ static void add_ignored_domain(const char *ascii) {
 }
 
 static bool ttl_usable(i32 ttl) {
-    return ttl > 0 || (g_config.cache_stale && ttl < 0 && (u32)-ttl <= g_config.cache_stale);
+    return ttl > 0 || (g_config.cache_stale && ttl <= 0 && -(i64)ttl <= g_config.cache_stale);
 }
 
 struct message *cache_get(const void *query, int qnamelen,
