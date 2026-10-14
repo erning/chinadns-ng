@@ -9,7 +9,8 @@
 #define CACHE_MSG_MAXSIZE DNS_EDNS_MAXSIZE
 
 void cache_init(void);
-struct message *cache_get(const void *query, int qnamelen,
+/* copy the usable reply for `query` into `out` (cap >= CACHE_MSG_MAXSIZE) */
+bool cache_get(const void *query, int qnamelen, struct message *out,
     i32 *ttl, i32 *refresh_ttl, bool *add_ip);
 bool cache_add(void *reply, size_t len, int qnamelen, i32 *ttl);
 void cache_dump(bool manual);

@@ -33,17 +33,17 @@ static void check_stale_boundaries(void) {
     g_config.cache_stale = 60;
     i32 ttl, refresh;
     bool add_ip;
+    struct message *cached = message_new(CACHE_MSG_MAXSIZE);
     assert(cache_add(reply, sizeof(reply), 3, &ttl) && ttl == 1);
     const time_t times[] = {100, 101, 102, 161};
     for (size_t i = 0; i < array_n(times); ++i) {
         current_time = times[i];
-        struct message *cached = cache_get(reply, 3, &ttl, &refresh, &add_ip);
-        assert(cached && ttl == 101 - current_time);
+        assert(cache_get(reply, 3, cached, &ttl, &refresh, &add_ip));
+        assert(ttl == 101 - current_time);
         assert(dns_get_ttl(cached->data, cached->len, 3, 0, 0, 0) == 1);
-        message_unref(cached);
     }
     current_time = 162;
-    assert(!cache_get(reply, 3, &ttl, &refresh, &add_ip));
+    assert(!cache_get(reply, 3, cached, &ttl, &refresh, &add_ip));
     assert(!cache_count);
 
     /* Dumping and restoring at TTL zero must preserve the stale entry too. */
@@ -59,18 +59,17 @@ static void check_stale_boundaries(void) {
     cache_remove(container_of(cache_lru.next, struct cache_entry, lru));
     cache_load();
     assert(cache_count == 1);
-    struct message *cached = cache_get(reply, 3, &ttl, &refresh, &add_ip);
-    assert(cached && ttl == 0);
-    message_unref(cached);
+    assert(cache_get(reply, 3, cached, &ttl, &refresh, &add_ip) && ttl == 0);
     unlink(path);
     g_config.cache_db = NULL;
 
     g_config.cache_stale = 0;
-    assert(!cache_get(reply, 3, &ttl, &refresh, &add_ip));
+    assert(!cache_get(reply, 3, cached, &ttl, &refresh, &add_ip));
     assert(!cache_count);
     g_config.cache_stale = 60;
     reply[28] = 0; /* An upstream TTL of zero is still not cacheable. */
     assert(!cache_add(reply, sizeof(reply), 3, &ttl));
+    message_unref(cached);
 }
 
 static void check_size_limit(void) {

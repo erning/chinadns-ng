@@ -191,6 +191,11 @@ static size_t query_bucket_count;
 static struct list_node query_deadlines;
 static size_t query_count;
 static u16 last_qid;
+/* Reused within one event: client queries, upstream UDP replies and locally
+ * built answers never outlive the handler that fills them. */
+static struct message *query_buf;
+static struct message *reply_buf;
+static struct message *answer_buf;
 static bool running = true;
 static const struct ipset_testctx *ip_testctx;
 static struct ipset_addctx *ip_addctx[TAG_NONE + 1];
@@ -618,8 +623,8 @@ static bool udp_pending_remove(struct upstream_session *s, u16 qid,
 static void upstream_on_reply(struct upstream_session *session, struct message *reply);
 
 static void udp_session_read(struct upstream_session *s) {
+    struct message *msg = reply_buf;
     for (;;) {
-        struct message *msg = message_new(DNS_EDNS_MAXSIZE);
         struct socket_addr peer = { .len = sizeof(peer.storage) };
         /* MSG_TRUNC: report the full datagram size even if it did not fit */
         ssize_t n = recvfrom(s->source.fd, msg->data, msg->cap, MSG_TRUNC,
@@ -637,12 +642,10 @@ static void udp_session_read(struct upstream_session *s) {
                 msg->len = (u16)n;
                 upstream_on_reply(s, msg);
             }
-            message_unref(msg);
             /* on_reply may have detached the source (last pending entry of a
              * retired session): stop before touching the dead fd */
             if (s->source.closed) return;
         } else {
-            message_unref(msg);
             if (n < 0 && errno == EINTR) continue;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
             if (n < 0) log_warning("recv(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
@@ -1135,17 +1138,18 @@ static void handle_query(struct message *msg, enum query_from from,
     size_t answer_len;
     u16 answer_count;
     if (local_rr_find(msg->data, qnamelen, &answer, &answer_len, &answer_count)) {
-        struct message *reply = message_new(dns_header_len() + dns_question_len(qnamelen) + answer_len);
+        size_t reply_len = dns_header_len() + dns_question_len(qnamelen) + answer_len;
+        struct message *reply = reply_len <= answer_buf->cap ? answer_buf : message_new(reply_len);
         if (!reply) {
             log_warning("local reply for %s exceeds the DNS message size limit", ascii);
             msg->len = dns_empty_reply(msg->data, qnamelen);
             send_immediate(msg, qnamelen, original_id, bufsz, from, udp_listener, peer, tcp_client);
             return;
         }
-        reply->len = reply->cap;
+        reply->len = (u16)reply_len;
         dns_make_reply(reply->data, msg->data, qnamelen, answer, answer_len, answer_count);
         send_immediate(reply, qnamelen, original_id, bufsz, from, udp_listener, peer, tcp_client);
-        message_unref(reply);
+        if (reply != answer_buf) message_unref(reply);
         return;
     }
 
@@ -1160,22 +1164,17 @@ static void handle_query(struct message *msg, enum query_from from,
     bool cacheable = dns_ecs_status(msg->data, msg->len, qnamelen) == 0;
     i32 ttl, refresh_ttl;
     bool add_ip;
-    struct message *cached = cacheable ?
-        cache_get(msg->data, qnamelen, &ttl, &refresh_ttl, &add_ip) : NULL;
-    if (cached) {
+    struct message *cached = answer_buf;
+    if (cacheable && cache_get(msg->data, qnamelen, cached, &ttl, &refresh_ttl, &add_ip)) {
         if (add_ip && tag != TAG_NONE && (qtype == DNS_TYPE_A || qtype == DNS_TYPE_AAAA) && ip_addctx[tag])
             dns_add_ip(cached->data, cached->len, qnamelen, ip_addctx[tag]);
         send_immediate(cached, qnamelen, original_id, bufsz, from, udp_listener, peer, tcp_client);
-        if (ttl > refresh_ttl) {
-            message_unref(cached);
-            return;
-        }
+        if (ttl > refresh_ttl) return;
         if (raw_udp && cached->len + 30 > DNS_EDNS_MINSIZE) raw_udp = false;
         from = QUERY_LOCAL;
         udp_listener = NULL;
         peer = NULL;
         tcp_client = NULL;
-        message_unref(cached);
     }
 
     struct query *q = query_new(msg, qnamelen, qtype, tag, bufsz, from,
@@ -1259,7 +1258,8 @@ static void upstream_on_reply(struct upstream_session *session, struct message *
             }
         } else if (session->config->tag == TAG_GFW) {
             if (q->verdict != VERDICT_NON_CHINA) {
-                if (!q->trust_reply) q->trust_reply = message_ref(reply);
+                /* copy: the reply may live in the shared receive buffer */
+                if (!q->trust_reply) q->trust_reply = message_from(reply->data, reply->len);
                 return;
             }
         }
@@ -1283,8 +1283,8 @@ static void upstream_on_reply(struct upstream_session *session, struct message *
 }
 
 static void udp_listener_read(struct listener *listener) {
+    struct message *msg = query_buf;
     for (;;) {
-        struct message *msg = message_new(DNS_QMSG_MAXSIZE);
         struct socket_addr peer = { .len = sizeof(peer.storage) };
         /* MSG_TRUNC: report the full datagram size even if it did not fit */
         ssize_t n = recvfrom(listener->source.fd, msg->data, msg->cap, MSG_TRUNC,
@@ -1294,13 +1294,10 @@ static void udp_listener_read(struct listener *listener) {
             log_warning("reject %zd-byte UDP query: exceeds %u bytes", n, (uint)msg->cap);
             msg->len = msg->cap;
             send_bad_query_reply(msg, QUERY_UDP, listener, &peer, NULL);
-            message_unref(msg);
         } else if (n > 0) {
             msg->len = (u16)n;
             handle_query(msg, QUERY_UDP, listener, &peer, NULL);
-            message_unref(msg);
         } else {
-            message_unref(msg);
             if (n < 0 && errno == EINTR) continue;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
             if (n < 0) log_warning("recvfrom listener failed: (%d) %s", errno, strerror(errno));
@@ -1330,9 +1327,10 @@ static void tcp_client_read(struct tcp_client *client) {
                 return;
             }
             if (client->input_len < (size_t)len + 2) break;
-            struct message *msg = message_from(client->input + 2, len);
-            handle_query(msg, QUERY_TCP, NULL, &client->peer, client);
-            message_unref(msg);
+            memcpy(query_buf->data, client->input + 2, len);
+            query_buf->len = len;
+            handle_query(query_buf, QUERY_TCP, NULL, &client->peer, client);
+            if (client->source.closed) return;
             size_t used = (size_t)len + 2;
             memmove(client->input, client->input + used, client->input_len - used);
             client->input_len -= used;
@@ -1623,6 +1621,9 @@ void server_init(void) {
     list_init(&query_deadlines);
     list_init(&clients);
     list_init(&closed_clients);
+    query_buf = message_new(DNS_QMSG_MAXSIZE);
+    reply_buf = message_new(DNS_EDNS_MAXSIZE);
+    answer_buf = message_new(CACHE_MSG_MAXSIZE);
     query_bucket_count = QUERY_INITIAL_BUCKETS;
     query_buckets = xcalloc(query_bucket_count, sizeof(*query_buckets));
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);

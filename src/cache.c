@@ -136,13 +136,13 @@ static bool ttl_usable(i32 ttl) {
     return ttl > 0 || (g_config.cache_stale && ttl <= 0 && -(i64)ttl <= g_config.cache_stale);
 }
 
-struct message *cache_get(const void *query, int qnamelen,
+bool cache_get(const void *query, int qnamelen, struct message *out,
     i32 *ttl, i32 *refresh_ttl, bool *add_ip) {
-    if (!g_config.cache_size) return NULL;
+    if (!g_config.cache_size) return false;
     size_t len = question_len(qnamelen);
     u32 hash = dns_question_hash(question_ptr(query), qnamelen);
     struct cache_entry *e = cache_find(query, qnamelen, hash);
-    if (!e) return NULL;
+    if (!e || e->msg_len > out->cap) return false;
     time_t now = time(NULL);
     i64 elapsed64 = now > e->update_time ? (i64)(now - e->update_time) : 0;
     i32 elapsed = elapsed64 > INT32_MAX ? INT32_MAX : (i32)elapsed64;
@@ -150,16 +150,17 @@ struct message *cache_get(const void *query, int qnamelen,
     *refresh_ttl = e->refresh_ttl;
     if (!ttl_usable(*ttl)) {
         cache_remove(e);
-        return NULL;
+        return false;
     }
     *add_ip = !e->added_ip;
     e->added_ip = true;
     list_remove(&e->lru);
     list_insert_after(&cache_lru, &e->lru);
-    struct message *copy = message_from(e->msg, e->msg_len);
-    memcpy(copy->data + dns_header_len(), question_ptr(query), len);
-    if (elapsed) dns_update_ttl(copy->data, copy->len, e->qnamelen, -elapsed);
-    return copy;
+    memcpy(out->data, e->msg, e->msg_len);
+    out->len = e->msg_len;
+    memcpy(out->data + dns_header_len(), question_ptr(query), len);
+    if (elapsed) dns_update_ttl(out->data, out->len, e->qnamelen, -elapsed);
+    return true;
 }
 
 bool cache_add(void *reply, size_t len, int qnamelen, i32 *ttl) {
