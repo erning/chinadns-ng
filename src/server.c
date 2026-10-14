@@ -146,14 +146,14 @@ enum tcp_state { TCP_DOWN, TCP_CONNECTING, TCP_TLS_HANDSHAKE, TCP_READY };
 
 struct upstream_session {
     struct event_source source;
-    struct upstream_session *next;
+    struct list_node node; /* in `sessions`, or `dead_sessions` once finished */
     struct upstream_config *config;
     u64 create_time;
     u64 retry_at;
-    u64 oldest_linger_at; /* earliest expire_at among lingering entries; 0 = none */
     u16 query_count;
     u32 pending_count;
     bool retired;
+    bool finished; /* retired with nothing pending: closed, awaiting free */
     bool tcp;
     union {
         struct {
@@ -184,7 +184,12 @@ static struct list_node clients; /* least recently active first */
 static struct list_node closed_clients; /* freed once no query refers to them */
 static size_t client_count;
 static size_t clients_out_bytes;
-static struct upstream_session *sessions;
+static struct list_node sessions;
+static struct list_node dead_sessions;
+/* when cleanup_pending must next walk the sessions: the earliest lingering
+ * entry expiry or TCP reconnect time; lowered whenever one is scheduled */
+static u64 sessions_wakeup_at;
+static u64 loop_now; /* monotonic ms, read once per event loop wakeup */
 static struct event_source signal_source = { .fd = -1, .closed = true };
 static struct query **query_buckets;
 static size_t query_bucket_count;
@@ -250,7 +255,7 @@ static int new_socket(int family, int type) {
 }
 
 static void client_touch(struct tcp_client *client) {
-    client->active_at = now_msec();
+    client->active_at = loop_now;
     list_remove(&client->node);
     list_insert_before(&clients, &client->node);
 }
@@ -301,7 +306,7 @@ static void clients_sweep(void) {
 /* Close clients without traffic for TCP_CLIENT_IDLE_MS. A client still
  * waiting for replies is kept: its queries end within upstream_timeout. */
 static void clients_expire(void) {
-    u64 now = now_msec();
+    u64 now = loop_now;
     while (!list_empty(&clients)) {
         struct tcp_client *client = container_of(clients.next, struct tcp_client, node);
         if (now < client->active_at + TCP_CLIENT_IDLE_MS) break;
@@ -428,6 +433,25 @@ static void query_ref_release(struct query_ref *ref) {
     ref->q_next = NULL;
 }
 
+static void sessions_wakeup(u64 at) {
+    if (at < sessions_wakeup_at) sessions_wakeup_at = at;
+}
+
+static void session_retry_later(struct upstream_session *s, u64 delay_ms) {
+    s->retry_at = loop_now + delay_ms;
+    sessions_wakeup(s->retry_at);
+}
+
+/* close a retired session once nothing is pending; sessions_sweep frees it
+ * after the current batch of events, which may still refer to it */
+static void session_finish(struct upstream_session *s) {
+    if (!s->retired || s->pending_count || s->finished) return;
+    s->finished = true;
+    source_detach(&s->source);
+    list_remove(&s->node);
+    list_insert_before(&dead_sessions, &s->node);
+}
+
 /* unlink from the session and free; the caller has released the query ref */
 static void udp_pending_free(struct upstream_session *s, struct pending_id *id) {
     if (id->prev) id->prev->next = id->next;
@@ -436,6 +460,7 @@ static void udp_pending_free(struct upstream_session *s, struct pending_id *id) 
     else s->u.udp.tail = id->prev;
     free(id);
     --s->pending_count;
+    session_finish(s);
 }
 
 static void tcp_request_free(struct upstream_session *s, struct tcp_request *req) {
@@ -445,6 +470,7 @@ static void tcp_request_free(struct upstream_session *s, struct tcp_request *req
     else s->u.tcp.tail = req->prev;
     free(req);
     --s->pending_count;
+    session_finish(s);
 }
 
 static void tcp_disconnect(struct upstream_session *s, bool retry);
@@ -469,7 +495,6 @@ static void query_release_refs(struct query *q) {
         } else if (!session_needs_linger(s)) {
             udp_pending_free(s, container_of(ref, struct pending_id, ref));
         }
-        if (s->retired && !s->pending_count) source_detach(&s->source);
     }
 }
 
@@ -506,7 +531,7 @@ static struct query *query_new(struct message *msg, int qnamelen, u16 qtype,
     if (!found) return NULL;
     query_grow();
     struct query *q = xcalloc(1, sizeof(*q));
-    q->request_time = now_msec();
+    q->request_time = loop_now;
     q->qid = qid;
     q->original_id = dns_get_id(msg->data);
     q->bufsz = bufsz;
@@ -573,20 +598,21 @@ static void send_bad_query_reply(struct message *msg, enum query_from from,
 
 static bool session_should_retire(struct upstream_session *s) {
     return (s->config->count && s->query_count >= s->config->count) ||
-        (s->config->life && now_msec() >= s->create_time + (u64)s->config->life * 1000);
+        (s->config->life && loop_now >= s->create_time + (u64)s->config->life * 1000);
 }
 
 static void session_mark_retired(struct upstream_session *s) {
     s->retired = true;
     if (s->config->runtime == s) s->config->runtime = NULL;
-    if (!s->pending_count) source_detach(&s->source);
+    session_finish(s);
 }
 
 static void udp_pending_add(struct upstream_session *s, struct query *q, struct message *msg) {
     size_t question_len = dns_question_len(q->qnamelen);
     struct pending_id *id = xcalloc(1, sizeof(*id) + question_len);
     id->qid = q->qid;
-    id->expire_at = now_msec() + (u64)g_config.upstream_timeout * 1000;
+    id->expire_at = loop_now + (u64)g_config.upstream_timeout * 1000;
+    if (session_needs_linger(s)) sessions_wakeup(id->expire_at);
     id->ref.session = s;
     id->ref.query = q;
     id->ref.qnamelen = q->qnamelen;
@@ -616,7 +642,6 @@ static bool udp_pending_remove(struct upstream_session *s, u16 qid,
     *query = id->ref.query;
     query_ref_release(&id->ref);
     udp_pending_free(s, id);
-    if (s->retired && !s->pending_count) source_detach(&s->source);
     return true;
 }
 
@@ -727,26 +752,26 @@ static void tcp_disconnect(struct upstream_session *s, bool retry) {
         req = next;
     }
     if (s->retired && !s->pending_count) return;
-    if (retry && s->pending_count) s->retry_at = now_msec() + 250;
+    if (retry && s->pending_count) session_retry_later(s, 250);
 }
 
 static bool tcp_start(struct upstream_session *s) {
     int fd = new_socket(socket_addr_family(&s->config->addr), SOCK_STREAM);
     if (fd < 0) {
         log_warning("socket(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
-        s->retry_at = now_msec() + 1000;
+        session_retry_later(s, 1000);
         return false;
     }
     int rc = connect(fd, (struct sockaddr *)&s->config->addr.storage, s->config->addr.len);
     if (rc < 0 && errno != EINPROGRESS) {
         log_warning("connect(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
         close(fd);
-        s->retry_at = now_msec() + 1000;
+        session_retry_later(s, 1000);
         return false;
     }
     if (!source_add(&s->source, fd, SOURCE_UPSTREAM_TCP,
         EPOLLIN | EPOLLOUT | EPOLLRDHUP)) {
-        s->retry_at = now_msec() + 1000;
+        session_retry_later(s, 1000);
         return false;
     }
     s->u.tcp.state = TCP_CONNECTING;
@@ -975,10 +1000,6 @@ static void tcp_session_read(struct upstream_session *s) {
         s->u.tcp.len_have = 0;
         upstream_on_reply(s, msg);
         message_unref(msg);
-        if (s->retired && !s->pending_count) {
-            source_detach(&s->source);
-            return;
-        }
     }
 }
 
@@ -986,11 +1007,11 @@ static bool udp_start(struct upstream_session *s) {
     int fd = new_socket(socket_addr_family(&s->config->addr), SOCK_DGRAM);
     if (fd < 0) {
         log_warning("socket(%s) failed: (%d) %s", s->config->url, errno, strerror(errno));
-        s->retry_at = now_msec() + 1000;
+        session_retry_later(s, 1000);
         return false;
     }
     if (!source_add(&s->source, fd, SOURCE_UPSTREAM_UDP, EPOLLIN)) {
-        s->retry_at = now_msec() + 1000;
+        session_retry_later(s, 1000);
         return false;
     }
     s->retry_at = 0;
@@ -1008,10 +1029,9 @@ static struct upstream_session *session_new(struct upstream_config *config) {
     s->source.fd = -1;
     s->source.closed = true;
     s->config = config;
-    s->create_time = now_msec();
+    s->create_time = loop_now;
     s->tcp = config->proto == UP_RAW_TCP || config->proto == UP_TCP || config->proto == UP_TLS;
-    s->next = sessions;
-    sessions = s;
+    list_insert_before(&sessions, &s->node);
     config->runtime = s;
     if (s->tcp) {
         s->u.tcp.state = TCP_DOWN;
@@ -1033,7 +1053,7 @@ static struct upstream_session *session_get(struct upstream_config *config) {
 static void session_send(struct upstream_config *config, struct query *q, struct message *msg) {
     struct upstream_session *s = session_get(config);
     u16 qid = dns_get_id(msg->data);
-    u64 now = now_msec();
+    u64 now = loop_now;
     if (!s->tcp) {
         if (s->source.closed && (!s->retry_at || now >= s->retry_at))
             udp_start(s);
@@ -1056,6 +1076,7 @@ static void session_send(struct upstream_config *config, struct query *q, struct
         req->qid = qid;
         req->frame_len = frame_len;
         req->expire_at = now + (u64)g_config.upstream_timeout * 1000;
+        if (session_needs_linger(s)) sessions_wakeup(req->expire_at);
         req->frame[0] = (u8)(msg->len >> 8);
         req->frame[1] = (u8)msg->len;
         memcpy(req->frame + 2, msg->data, msg->len);
@@ -1070,7 +1091,10 @@ static void session_send(struct upstream_config *config, struct query *q, struct
         else s->u.tcp.head = req;
         s->u.tcp.tail = req;
         ++s->pending_count;
-        if (s->u.tcp.state == TCP_DOWN && !s->retry_at) tcp_start(s);
+        if (s->u.tcp.state == TCP_DOWN) {
+            if (!s->retry_at || now >= s->retry_at) tcp_start(s);
+            else sessions_wakeup(s->retry_at);
+        }
         if (!s->source.closed) tcp_update_events(s);
     }
     ++s->query_count;
@@ -1109,7 +1133,7 @@ static void send_group(u8 tag, struct query *q, struct message *msg, bool raw_ud
     /* passive health-check: remember when the primary path has an outstanding
      * (so-far unanswered) query, so group_health_check can detect all-primary-down */
     if (group->fallback_enabled && sent_primary && !group->pending_since)
-        group->pending_since = now_msec();
+        group->pending_since = loop_now;
 }
 
 static void handle_query(struct message *msg, enum query_from from,
@@ -1370,7 +1394,7 @@ static void tcp_listener_accept(struct listener *listener) {
                 free(client);
                 return;
             }
-            client->active_at = now_msec();
+            client->active_at = loop_now;
             list_insert_before(&clients, &client->node);
             ++client_count;
         } else if (errno == EINTR) {
@@ -1457,7 +1481,7 @@ static void init_signal_source(void) {
 }
 
 static void cleanup_pending(void) {
-    u64 now = now_msec();
+    u64 now = loop_now;
     while (!list_empty(&query_deadlines)) {
         struct query *q = container_of(query_deadlines.next, struct query, deadline);
         if (q->request_time + (u64)g_config.upstream_timeout * 1000 > now) break;
@@ -1467,11 +1491,17 @@ static void cleanup_pending(void) {
     /* entries bound to a live query were just released by the query_delete
      * calls above, so all that is left here is ageing out the orphans that a
      * session serving the passive health-check keeps (a late reply must still
-     * be recognizable as a primary-recovery signal). entries are in send
-     * order, so `expire_at` grows along the list and the orphans due for
-     * purging are a prefix of it — the scan stops at the first entry that is
-     * still within its window instead of walking the whole list. */
-    for (struct upstream_session *s = sessions; s; s = s->next) {
+     * be recognizable as a primary-recovery signal), and reconnecting TCP.
+     * both are scheduled through sessions_wakeup, so the sessions are only
+     * walked when one is due. entries are in send order, so `expire_at` grows
+     * along the list and the orphans due for purging are a prefix of it — the
+     * scan stops at the first entry that is still within its window. */
+    if (now < sessions_wakeup_at) return;
+    u64 wakeup = UINT64_MAX;
+    struct list_node *n = sessions.next;
+    while (n != &sessions) {
+        struct upstream_session *s = container_of(n, struct upstream_session, node);
+        n = n->next; /* freeing the last entry moves a retired session away */
         u64 oldest = 0; /* earliest expire_at still to come; 0 = nothing left */
         if (!s->tcp) {
             struct pending_id *id = s->u.udp.head;
@@ -1483,7 +1513,6 @@ static void cleanup_pending(void) {
                 if (!id->ref.query) udp_pending_free(s, id);
                 id = next;
             }
-            if (s->retired && !s->pending_count) source_detach(&s->source);
         } else {
             struct tcp_request *req = s->u.tcp.head;
             while (req) {
@@ -1492,28 +1521,22 @@ static void cleanup_pending(void) {
                 if (!req->ref.query) tcp_request_free(s, req);
                 req = next;
             }
-            if (s->retired && !s->pending_count) {
-                source_detach(&s->source);
-            } else if (s->u.tcp.state == TCP_DOWN && s->pending_count &&
-                s->retry_at && now >= s->retry_at) {
-                tcp_start(s);
+            if (!s->finished && s->u.tcp.state == TCP_DOWN && s->pending_count && s->retry_at) {
+                if (now >= s->retry_at) tcp_start(s); /* reschedules on failure */
+                if (s->retry_at && s->retry_at < wakeup) wakeup = s->retry_at;
             }
         }
         /* only a linger session can hold an entry past its query's deadline,
          * so only it needs a wakeup of its own */
-        s->oldest_linger_at = session_needs_linger(s) ? oldest : 0;
+        if (oldest && session_needs_linger(s) && oldest < wakeup) wakeup = oldest;
     }
+    sessions_wakeup_at = wakeup;
 }
 
 static void sessions_sweep(void) {
-    struct upstream_session **p = &sessions;
-    while (*p) {
-        struct upstream_session *s = *p;
-        if (!s->source.closed || s->pending_count || !s->retired) {
-            p = &s->next;
-            continue;
-        }
-        *p = s->next;
+    while (!list_empty(&dead_sessions)) {
+        struct upstream_session *s = container_of(dead_sessions.next, struct upstream_session, node);
+        list_remove(&s->node);
         if (s->config->runtime == s) s->config->runtime = NULL;
         if (s->tcp) {
 #ifdef ENABLE_WOLFSSL
@@ -1529,7 +1552,7 @@ static void sessions_sweep(void) {
  * have stayed unanswered for `timeout-sec`, so queries also go to ?fallback */
 static void group_health_check(void) {
     u64 timeout_ms = (u64)g_config.upstream_timeout * 1000;
-    u64 now = now_msec();
+    u64 now = loop_now;
     for (u8 tag = 0; tag <= TAG__MAX; ++tag) {
         struct group_config *group = &g_config.groups[tag];
         if (!group->fallback_enabled || !group->primary_healthy || !group->pending_since)
@@ -1543,19 +1566,12 @@ static void group_health_check(void) {
 }
 
 static int next_timeout(void) {
-    u64 now = now_msec();
-    u64 deadline = UINT64_MAX;
+    u64 now = loop_now;
+    u64 deadline = sessions_wakeup_at; /* TCP reconnects, lingering entries */
     if (!list_empty(&query_deadlines)) {
         struct query *q = container_of(query_deadlines.next, struct query, deadline);
-        deadline = q->request_time + (u64)g_config.upstream_timeout * 1000;
-    }
-    for (struct upstream_session *s = sessions; s; s = s->next) {
-        if (s->tcp && s->u.tcp.state == TCP_DOWN && s->pending_count && s->retry_at && s->retry_at < deadline)
-            deadline = s->retry_at;
-        /* wake up to age out lingering session entries (cleanup_pending keeps
-         * this field fresh; 0 means nothing is lingering) */
-        if (s->oldest_linger_at && s->oldest_linger_at < deadline)
-            deadline = s->oldest_linger_at;
+        u64 at = q->request_time + (u64)g_config.upstream_timeout * 1000;
+        if (at < deadline) deadline = at;
     }
     if (!list_empty(&clients)) {
         struct tcp_client *client = container_of(clients.next, struct tcp_client, node);
@@ -1621,6 +1637,10 @@ void server_init(void) {
     list_init(&query_deadlines);
     list_init(&clients);
     list_init(&closed_clients);
+    list_init(&sessions);
+    list_init(&dead_sessions);
+    sessions_wakeup_at = UINT64_MAX;
+    loop_now = now_msec();
     query_buf = message_new(DNS_QMSG_MAXSIZE);
     reply_buf = message_new(DNS_EDNS_MAXSIZE);
     answer_buf = message_new(CACHE_MSG_MAXSIZE);
@@ -1684,7 +1704,9 @@ void server_init(void) {
 void server_run(void) {
     struct epoll_event events[MAX_EVENTS];
     while (running) {
+        loop_now = now_msec();
         int count = epoll_wait(epoll_fd, events, MAX_EVENTS, next_timeout());
+        loop_now = now_msec();
         if (count < 0) {
             if (errno == EINTR) continue;
             log_error("epoll_wait failed: (%d) %s", errno, strerror(errno));

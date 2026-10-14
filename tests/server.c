@@ -165,12 +165,13 @@ static struct tcp_client *new_test_client(void) {
 static void check_tcp_clients(void) {
     list_init(&clients);
     list_init(&closed_clients);
+    loop_now = now_msec();
 
     /* Idle clients close; a client awaiting replies is re-armed instead. */
     struct tcp_client *idle = new_test_client();
     struct tcp_client *busy = new_test_client();
     busy->refs = 1;
-    idle->active_at = busy->active_at = now_msec() - TCP_CLIENT_IDLE_MS - 1;
+    idle->active_at = busy->active_at = loop_now - TCP_CLIENT_IDLE_MS - 1;
     clients_expire();
     assert(idle->source.closed && !busy->source.closed);
     assert(client_count == 1 && clients.next == &busy->node);
