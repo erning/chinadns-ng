@@ -7,7 +7,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-#define CHINADNS_VERSION "2026.10.14-c"
+#define CHINADNS_VERSION "2026.10.14-c-dev"
 #define CHINADNS_URL "https://github.com/erning/chinadns-ng"
 
 struct strvec {
