@@ -42,6 +42,13 @@ def add_ecs(query, subnet):
     return bytes(result) + b"\0" + struct.pack("!HHIH", 41, 1232, 0, len(options)) + options
 
 
+def add_padding(query, size):
+    options = struct.pack("!HH", 12, size) + bytes(size)
+    result = bytearray(query)
+    struct.pack_into("!H", result, 10, 1)
+    return bytes(result) + b"\0" + struct.pack("!HHIH", 41, 1232, 0, len(options)) + options
+
+
 def question_end(message):
     pos = 12
     while message[pos]:
@@ -1151,6 +1158,21 @@ def check_resource_exhaustion(binary):
         server.close()
 
 
+def check_query_size(binary):
+    server = ChinaDNS(binary, "--default-tag", "chn", "--dns-rr-ip", "size.local=192.0.2.121")
+    try:
+        query = add_padding(make_query("size.local", 1, 0x4321), 1000)
+        for tcp in (False, True):
+            assert answer_ip(server.query_message(query, tcp=tcp))[0] == "192.0.2.121"
+        # an oversized datagram is rejected instead of forwarded cut off
+        reply = server.query_message(add_padding(make_query("size.local", 1, 0x4322), 4200))
+        assert len(reply) == 12
+        ident, flags, qdcount = struct.unpack_from("!HHH", reply)
+        assert ident == 0x4322 and flags & 0x8000 and flags & 0x000F == 1 and qdcount == 0
+    finally:
+        server.close()
+
+
 def check_tcp_client_limits(binary):
     server = ChinaDNS(binary, "--default-tag", "chn", "--dns-rr-ip", "tcp-limit.local=192.0.2.120")
     idle = []
@@ -1303,6 +1325,7 @@ def main():
     if os.environ.get("CHINADNS_TEST_SKIP_RESOURCE") != "1":
         check_resource_exhaustion(binary)
     check_tcp_client_limits(binary)
+    check_query_size(binary)
     check_hash_growth(binary)
     if os.environ.get("CHINADNS_TEST_VERDICT") == "1":
         check_verdict(binary)

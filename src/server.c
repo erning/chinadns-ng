@@ -557,7 +557,7 @@ static void send_bad_query_reply(struct message *msg, enum query_from from,
     struct listener *udp_listener, const struct socket_addr *peer,
     struct tcp_client *tcp_client) {
     if (msg->len >= dns_header_len())
-        msg->len = dns_empty_reply(msg->data, 0);
+        msg->len = dns_bad_query_reply(msg->data);
     if (from == QUERY_UDP) {
         sendto(udp_listener->source.fd, msg->data, msg->len, 0,
             (const struct sockaddr *)&peer->storage, peer->len);
@@ -621,7 +621,8 @@ static void udp_session_read(struct upstream_session *s) {
     for (;;) {
         struct message *msg = message_new(DNS_EDNS_MAXSIZE);
         struct socket_addr peer = { .len = sizeof(peer.storage) };
-        ssize_t n = recvfrom(s->source.fd, msg->data, msg->cap, 0,
+        /* MSG_TRUNC: report the full datagram size even if it did not fit */
+        ssize_t n = recvfrom(s->source.fd, msg->data, msg->cap, MSG_TRUNC,
             (struct sockaddr *)&peer.storage, &peer.len);
         if (n > 0) {
             /* the socket only ever queries config->addr: a reply from any other
@@ -629,6 +630,9 @@ static void udp_session_read(struct upstream_session *s) {
             if (peer.len != s->config->addr.len ||
                 memcmp(&peer.storage, &s->config->addr.storage, peer.len) != 0) {
                 log_verbose("ignore reply from unexpected peer of %s", s->config->url);
+            } else if (n > msg->cap) {
+                log_warning("ignore %zd-byte reply from %s: exceeds %u bytes",
+                    n, s->config->url, (uint)msg->cap);
             } else {
                 msg->len = (u16)n;
                 upstream_on_reply(s, msg);
@@ -1282,9 +1286,16 @@ static void udp_listener_read(struct listener *listener) {
     for (;;) {
         struct message *msg = message_new(DNS_QMSG_MAXSIZE);
         struct socket_addr peer = { .len = sizeof(peer.storage) };
-        ssize_t n = recvfrom(listener->source.fd, msg->data, msg->cap, 0,
+        /* MSG_TRUNC: report the full datagram size even if it did not fit */
+        ssize_t n = recvfrom(listener->source.fd, msg->data, msg->cap, MSG_TRUNC,
             (struct sockaddr *)&peer.storage, &peer.len);
-        if (n > 0) {
+        if (n > msg->cap) {
+            /* never forward the cut-off part of an oversized query */
+            log_warning("reject %zd-byte UDP query: exceeds %u bytes", n, (uint)msg->cap);
+            msg->len = msg->cap;
+            send_bad_query_reply(msg, QUERY_UDP, listener, &peer, NULL);
+            message_unref(msg);
+        } else if (n > 0) {
             msg->len = (u16)n;
             handle_query(msg, QUERY_UDP, listener, &peer, NULL);
             message_unref(msg);

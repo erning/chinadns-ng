@@ -9,7 +9,8 @@
 #define DNS_MSG_MINSIZE (12 /* sizeof(struct dns_header) */ + DNS_NAME_WIRE_MINLEN + 4 /* sizeof(struct dns_question) */)
 #define DNS_MSG_MAXSIZE 65535
 
-#define DNS_QMSG_MAXSIZE 512
+/* largest query accepted from clients (UDP datagram or TCP frame) */
+#define DNS_QMSG_MAXSIZE 4096
 
 #define DNS_EDNS_MINSIZE 512
 #define DNS_EDNS_MAXSIZE 4096
@@ -28,6 +29,7 @@
 #define DNS_QR_REPLY 1
 
 #define DNS_RCODE_NOERROR 0
+#define DNS_RCODE_FORMERR 1
 #define DNS_RCODE_NXDOMAIN 3
 
 #define DNS_CLASS_IN 1
@@ -85,6 +87,9 @@ u16 dns_truncate(const void *noalias msg, ssize_t len, void *noalias out);
 
 /* keep only the HEADER and QUESTION section */
 u16 dns_empty_reply(void *noalias msg, int qnamelen);
+
+/* FORMERR reply with only the HEADER (query may be malformed or cut off) */
+u16 dns_bad_query_reply(void *noalias msg);
 
 /* check query msg, `ascii_name` used to get domain name */
 bool dns_check_query(void *noalias msg, ssize_t len, char *noalias ascii_name, int *noalias p_qnamelen);

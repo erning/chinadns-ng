@@ -428,6 +428,18 @@ u16 dns_empty_reply(void *noalias msg, int qnamelen) {
     return qnamelen > 0 ? msg_minlen(qnamelen) : sizeof(struct dns_header);
 }
 
+u16 dns_bad_query_reply(void *noalias msg) {
+    struct dns_header *h = msg;
+    h->qr = DNS_QR_REPLY;
+    h->ra = 1;
+    h->rcode = DNS_RCODE_FORMERR;
+    h->question_count = 0;
+    h->answer_count = 0;
+    h->authority_count = 0;
+    h->additional_count = 0;
+    return sizeof(struct dns_header);
+}
+
 // return newlen (0 if failed)
 static u16 rm_additional(void *noalias msg, ssize_t len, int qnamelen) {
     if (!dns_is_good(msg))
