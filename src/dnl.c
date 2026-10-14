@@ -24,15 +24,20 @@
 /* for L1 map */
 #define MAX_COLLISION 4
 
+/* L1 buckets per item, x/y (load factor 0.75 ~ 1.5, overflow goes to L2) */
+#define L1_BUCKETS_X 2
+#define L1_BUCKETS_Y 3
+
 /* u32 (bit-field) */
 #define NAMEADDR_BIT 29
 
 #define NAMEADDR_END ((U32C(1) << NAMEADDR_BIT) - 1)
 
+/* the hash is recomputed when needed instead of stored: lists are short and
+ * compare namelen first, and storing it would cost 4 bytes for every name */
 struct name {
     u32 next:NAMEADDR_BIT; /* addr in s_base */
     u32 tag:(32-NAMEADDR_BIT);
-    uint hashv;
     u8 namelen;
     char name[];
 } __attribute__((packed));
@@ -108,32 +113,30 @@ static u32 alloc(u32 sz, u32 align) {
 /* ======================== name ======================== */
 
 #define get_hashv(nameaddr) \
-    (ptr_name(nameaddr)->hashv)
+    calc_hashv(ptr_name(nameaddr)->name, ptr_name(nameaddr)->namelen)
 
 #define get_namesz(nameaddr) \
     (sizeof(struct name) + ptr_name(nameaddr)->namelen)
 
 static u32 add_name(const char *noalias name, u8 tag) {
     u8 namelen = strlen(name);
-    uint hashv = calc_hashv(name, namelen);
     u32 nameaddr = alloc_name(namelen);
     struct name *noalias p = ptr_name(nameaddr);
     p->next = NAMEADDR_END;
     p->tag = tag;
-    p->hashv = hashv;
     p->namelen = namelen;
     memcpy(p->name, name, namelen);
     return nameaddr;
 }
 
-static inline bool name_eq_r(u32 addr, uint hashv, u8 namelen, const char *noalias name) {
+static inline bool name_eq_r(u32 addr, u8 namelen, const char *noalias name) {
     const struct name *noalias p = ptr_name(addr);
-    return p->hashv == hashv && p->namelen == namelen && memcmp(p->name, name, namelen) == 0;
+    return p->namelen == namelen && memcmp(p->name, name, namelen) == 0;
 }
 
 static inline bool name_eq(u32 addr1, u32 addr2) {
     const struct name *noalias p = ptr_name(addr2);
-    return addr1 == addr2 || name_eq_r(addr1, p->hashv, p->namelen, p->name);
+    return addr1 == addr2 || name_eq_r(addr1, p->namelen, p->name);
 }
 
 /* ======================== bucket ======================== */
@@ -224,7 +227,7 @@ static bool resize_map2(void) {
         foreach_list(bucket, curaddr) {
             struct name *cur = ptr_name(curaddr);
 
-            u32 newidx = map_idx(map, cur->hashv);
+            u32 newidx = map_idx(map, calc_hashv(cur->name, cur->namelen));
             if (newidx == idx) {
                 prev = cur;
                 continue;
@@ -318,10 +321,10 @@ static void add_to_dnl(u32 nameaddr) {
 }
 
 static bool exists_in_list(const struct bucket *noalias bucket,
-    uint hashv, u8 namelen, const char *noalias name, u8 *noalias tag)
+    u8 namelen, const char *noalias name, u8 *noalias tag)
 {
     foreach_list(bucket, curaddr) {
-        if (name_eq_r(curaddr, hashv, namelen, name)) {
+        if (name_eq_r(curaddr, namelen, name)) {
             *tag = ptr_name(curaddr)->tag;
             return true;
         }
@@ -334,10 +337,10 @@ static bool exists_in_dnl(const char *noalias name, u8 namelen, u8 *noalias tag)
     const struct bucket *noalias bucket = get_bucket_by_hashv(&s_map1, hashv);
     switch (bucket->state) {
         case BUCKET_HEAD:
-            return exists_in_list(bucket, hashv, namelen, name, tag);
+            return exists_in_list(bucket, namelen, name, tag);
         case BUCKET_NEXT:
             bucket = get_bucket_by_hashv(&s_map2, hashv);
-            return bucket->state == BUCKET_HEAD && exists_in_list(bucket, hashv, namelen, name, tag);
+            return bucket->state == BUCKET_HEAD && exists_in_list(bucket, namelen, name, tag);
         default:
             return false;
     }
@@ -528,7 +531,7 @@ void dnl_init(const filenames_t tag_to_filenames[TAG__MAX + 1], bool gfwlist_fir
     }
     if (total_count == 0) return;
 
-    dnl_set_notnull(calc_lcap(total_count), 0);
+    dnl_set_notnull(calc_lcap(ceilu(total_count * L1_BUCKETS_X, L1_BUCKETS_Y)), 0);
 
     /* names added to the map first have higher priority */
     u8 ordered_tags[TAG__MAX + 1]; /* high -> low */
