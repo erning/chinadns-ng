@@ -64,7 +64,7 @@ void strvec_push(struct strvec *vec, const char *str) {
 bool socket_addr_parse(struct socket_addr *addr, const char *ip, u16 port) {
     memset(addr, 0, sizeof(*addr));
 
-    struct sockaddr_in *v4 = (struct sockaddr_in *)&addr->storage;
+    struct sockaddr_in *v4 = &addr->storage.in4;
     if (inet_pton(AF_INET, ip, &v4->sin_addr) == 1) {
         v4->sin_family = AF_INET;
         v4->sin_port = htons(port);
@@ -72,7 +72,7 @@ bool socket_addr_parse(struct socket_addr *addr, const char *ip, u16 port) {
         return true;
     }
 
-    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&addr->storage;
+    struct sockaddr_in6 *v6 = &addr->storage.in6;
     if (inet_pton(AF_INET6, ip, &v6->sin6_addr) == 1) {
         v6->sin6_family = AF_INET6;
         v6->sin6_port = htons(port);
@@ -84,7 +84,7 @@ bool socket_addr_parse(struct socket_addr *addr, const char *ip, u16 port) {
 }
 
 int socket_addr_family(const struct socket_addr *addr) {
-    return addr->storage.ss_family;
+    return addr->storage.sa.sa_family;
 }
 
 int set_nonblocking(int fd) {

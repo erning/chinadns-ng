@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 
 #define CHINADNS_VERSION "2026.08.16-c-dev"
 #define CHINADNS_URL "https://github.com/erning/chinadns-ng"
@@ -24,8 +25,13 @@ char *xstrndup(const char *str, size_t len);
 void strvec_push(struct strvec *vec, const char *str);
 void strvec_push_n(struct strvec *vec, const char *str, size_t len);
 
+/* IPv4/IPv6 only: 28 bytes, where sockaddr_storage would take 128 */
 struct socket_addr {
-    struct sockaddr_storage storage;
+    union {
+        struct sockaddr sa;
+        struct sockaddr_in in4;
+        struct sockaddr_in6 in6;
+    } storage;
     socklen_t len;
 };
 
