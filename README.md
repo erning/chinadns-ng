@@ -305,6 +305,7 @@ bug report: https://github.com/erning/chinadns-ng. email: zfl9.com@gmail.com (Ot
   - 2024.03.07 版本起，`bind-addr` 允许指定多次，以便监听多个不同的 ip 地址。
 - `bind-port` 用于指定监听端口，默认为 65353。
   - 2024.03.07 版本起，将同时监听 UDP 和 TCP 端口，之前只监听了 UDP。
+    - TCP 最多同时保持 64 个客户端连接，连接已满时关闭最久未活动的连接；空闲超过 10 秒的连接会被关闭。
   - 2024.03.25 版本起，可以给 `bind-port` 指定要监听的协议（UDP、TCP）：
     - `--bind-port 65353`：监听 UDP 和 TCP（默认）。
     - `--bind-port 65353@udp`：只监听 UDP。

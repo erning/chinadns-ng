@@ -1151,6 +1151,27 @@ def check_resource_exhaustion(binary):
         server.close()
 
 
+def check_tcp_client_limits(binary):
+    server = ChinaDNS(binary, "--default-tag", "chn", "--dns-rr-ip", "tcp-limit.local=192.0.2.120")
+    idle = []
+    try:
+        time.sleep(0.1)  # let the readiness probe connection close first
+        for _ in range(64):
+            idle.append(socket.create_connection(("127.0.0.1", server.port), timeout=2))
+        time.sleep(0.1)
+        # at the connection limit, the least recently active client makes room
+        assert answer_ip(server.query("tcp-limit.local", tcp=True))[0] == "192.0.2.120"
+        idle[0].settimeout(2)
+        assert idle[0].recv(1) == b""
+        idle[1].sendall(struct.pack("!H", 0))
+        idle[1].settimeout(2)
+        assert idle[1].recv(1) == b""
+    finally:
+        for sock in idle:
+            sock.close()
+        server.close()
+
+
 def check_hash_growth(binary):
     with tempfile.TemporaryDirectory() as directory:
         hosts = os.path.join(directory, "many-hosts")
@@ -1281,6 +1302,7 @@ def main():
     check_fallback_no_amplification(binary)
     if os.environ.get("CHINADNS_TEST_SKIP_RESOURCE") != "1":
         check_resource_exhaustion(binary)
+    check_tcp_client_limits(binary)
     check_hash_growth(binary)
     if os.environ.get("CHINADNS_TEST_VERDICT") == "1":
         check_verdict(binary)

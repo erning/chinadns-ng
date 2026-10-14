@@ -31,7 +31,11 @@
 
 #define MAX_EVENTS 64
 #define QUERY_INITIAL_BUCKETS 1024
-#define MAX_CLIENT_OUTPUT (1024U * 1024U)
+#define MAX_TCP_CLIENTS 64
+#define TCP_CLIENT_IDLE_MS 10000
+/* a client may queue two maximum-size replies; all clients share a ceiling */
+#define MAX_CLIENT_OUTPUT (2 * (2 + DNS_MSG_MAXSIZE))
+#define MAX_TOTAL_CLIENT_OUTPUT (1024U * 1024U)
 
 enum source_kind {
     SOURCE_UDP_LISTENER,
@@ -66,8 +70,9 @@ struct out_chunk {
 
 struct tcp_client {
     struct event_source source;
-    struct tcp_client *next;
+    struct list_node node; /* open: ordered by active_at; closed: awaiting free */
     struct socket_addr peer;
+    u64 active_at;
     unsigned refs;
     bool read_closed;
     size_t input_len;
@@ -175,7 +180,10 @@ struct upstream_session {
 
 static int epoll_fd = -1;
 static struct listener *listeners;
-static struct tcp_client *clients;
+static struct list_node clients; /* least recently active first */
+static struct list_node closed_clients; /* freed once no query refers to them */
+static size_t client_count;
+static size_t clients_out_bytes;
 static struct upstream_session *sessions;
 static struct event_source signal_source = { .fd = -1, .closed = true };
 static struct query **query_buckets;
@@ -236,6 +244,12 @@ static int new_socket(int family, int type) {
     return fd;
 }
 
+static void client_touch(struct tcp_client *client) {
+    client->active_at = now_msec();
+    list_remove(&client->node);
+    list_insert_before(&clients, &client->node);
+}
+
 static void client_close(struct tcp_client *client) {
     if (client->source.closed) return;
     source_detach(&client->source);
@@ -245,7 +259,11 @@ static void client_close(struct tcp_client *client) {
         client->out_head = next;
     }
     client->out_tail = NULL;
+    clients_out_bytes -= client->out_bytes;
     client->out_bytes = 0;
+    list_remove(&client->node);
+    list_insert_before(&closed_clients, &client->node);
+    --client_count;
 }
 
 static void client_update_events(struct tcp_client *client) {
@@ -265,26 +283,53 @@ static void client_read_eof(struct tcp_client *client) {
 }
 
 static void clients_sweep(void) {
-    struct tcp_client **p = &clients;
-    while (*p) {
-        struct tcp_client *client = *p;
-        if (client->source.closed && client->refs == 0) {
-            *p = client->next;
-            free(client);
-        } else {
-            p = &client->next;
-        }
+    struct list_node *n = closed_clients.next;
+    while (n != &closed_clients) {
+        struct tcp_client *client = container_of(n, struct tcp_client, node);
+        n = n->next;
+        if (client->refs) continue;
+        list_remove(&client->node);
+        free(client);
     }
 }
 
+/* Close clients without traffic for TCP_CLIENT_IDLE_MS. A client still
+ * waiting for replies is kept: its queries end within upstream_timeout. */
+static void clients_expire(void) {
+    u64 now = now_msec();
+    while (!list_empty(&clients)) {
+        struct tcp_client *client = container_of(clients.next, struct tcp_client, node);
+        if (now < client->active_at + TCP_CLIENT_IDLE_MS) break;
+        if (client->refs) {
+            client_touch(client);
+            continue;
+        }
+        log_verbose("close idle TCP client fd:%d", client->source.fd);
+        client_close(client);
+    }
+}
+
+/* make room for a new client by closing the least recently active one */
+static bool client_evict(void) {
+    if (list_empty(&clients)) return false;
+    struct tcp_client *client = container_of(clients.next, struct tcp_client, node);
+    if (client->refs) return false;
+    log_verbose("close TCP client fd:%d: %d connections open", client->source.fd, MAX_TCP_CLIENTS);
+    client_close(client);
+    return true;
+}
+
+static void client_write(struct tcp_client *client);
+
 static void client_queue_reply(struct tcp_client *client, const void *data, size_t len) {
     if (client->source.closed || len > UINT16_MAX) return;
-    if (2 + len > MAX_CLIENT_OUTPUT - client->out_bytes) {
-        log_warning("close slow TCP client fd:%d: output queue exceeds %u bytes",
-            client->source.fd, MAX_CLIENT_OUTPUT);
+    if (2 + len > MAX_CLIENT_OUTPUT - client->out_bytes ||
+        2 + len > MAX_TOTAL_CLIENT_OUTPUT - clients_out_bytes) {
+        log_warning("close slow TCP client fd:%d: output queue is full", client->source.fd);
         client_close(client);
         return;
     }
+    bool idle = !client->out_head;
     struct out_chunk *chunk = xmalloc(sizeof(*chunk) + 2 + len);
     chunk->next = NULL;
     chunk->len = 2 + len;
@@ -296,7 +341,9 @@ static void client_queue_reply(struct tcp_client *client, const void *data, size
     else client->out_head = chunk;
     client->out_tail = chunk;
     client->out_bytes += chunk->len;
-    client_update_events(client);
+    clients_out_bytes += chunk->len;
+    /* write at once instead of waiting for EPOLLOUT when nothing is queued */
+    if (idle) client_write(client);
 }
 
 static void client_write(struct tcp_client *client) {
@@ -306,6 +353,8 @@ static void client_write(struct tcp_client *client) {
         if (n > 0) {
             chunk->off += (size_t)n;
             client->out_bytes -= (size_t)n;
+            clients_out_bytes -= (size_t)n;
+            client_touch(client);
             if (chunk->off < chunk->len) continue;
             client->out_head = chunk->next;
             if (!client->out_head) client->out_tail = NULL;
@@ -1253,7 +1302,10 @@ static void tcp_client_read(struct tcp_client *client) {
     for (;;) {
         ssize_t n = recv(client->source.fd, client->input + client->input_len,
             sizeof(client->input) - client->input_len, 0);
-        if (n > 0) client->input_len += (size_t)n;
+        if (n > 0) {
+            client->input_len += (size_t)n;
+            client_touch(client);
+        }
         else if (n == 0) { client_read_eof(client); return; }
         else if (errno == EINTR) continue;
         else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -1296,6 +1348,11 @@ static void tcp_listener_accept(struct listener *listener) {
             }
         }
         if (fd >= 0) {
+            if (client_count >= MAX_TCP_CLIENTS && !client_evict()) {
+                log_verbose("reject TCP client: %d connections busy", MAX_TCP_CLIENTS);
+                close(fd);
+                continue;
+            }
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             struct tcp_client *client = xcalloc(1, sizeof(*client));
@@ -1304,8 +1361,9 @@ static void tcp_listener_accept(struct listener *listener) {
                 free(client);
                 return;
             }
-            client->next = clients;
-            clients = client;
+            client->active_at = now_msec();
+            list_insert_before(&clients, &client->node);
+            ++client_count;
         } else if (errno == EINTR) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1490,6 +1548,11 @@ static int next_timeout(void) {
         if (s->oldest_linger_at && s->oldest_linger_at < deadline)
             deadline = s->oldest_linger_at;
     }
+    if (!list_empty(&clients)) {
+        struct tcp_client *client = container_of(clients.next, struct tcp_client, node);
+        if (client->active_at + TCP_CLIENT_IDLE_MS < deadline)
+            deadline = client->active_at + TCP_CLIENT_IDLE_MS;
+    }
     /* keep the epoll wait in sync with the passive health-check deadline */
     u64 timeout_ms = (u64)g_config.upstream_timeout * 1000;
     for (u8 tag = 0; tag <= TAG__MAX; ++tag) {
@@ -1547,6 +1610,8 @@ static void tls_init(void) {
 
 void server_init(void) {
     list_init(&query_deadlines);
+    list_init(&clients);
+    list_init(&closed_clients);
     query_bucket_count = QUERY_INITIAL_BUCKETS;
     query_buckets = xcalloc(query_bucket_count, sizeof(*query_buckets));
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -1661,6 +1726,7 @@ void server_run(void) {
         }
         cleanup_pending();
         group_health_check();
+        clients_expire();
         clients_sweep();
         sessions_sweep();
     }

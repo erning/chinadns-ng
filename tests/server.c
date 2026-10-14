@@ -11,6 +11,7 @@ static u8 output[1024];
 static size_t output_len;
 static ssize_t first_write;
 static bool first_call;
+static bool block_send;
 
 int test_dns_test_ip(const void *msg, ssize_t len, int qnamelen, const struct ipset_testctx *ctx) {
     (void)msg; (void)len; (void)qnamelen; (void)ctx;
@@ -25,6 +26,7 @@ int test_epoll_ctl(int fd, int op, int target, struct epoll_event *event) {
 ssize_t test_send(int fd, const void *data, size_t len, int flags) {
     (void)fd; (void)flags;
     ssize_t n = (ssize_t)len;
+    if (block_send) n = -1;
     if (first_call) {
         first_call = false;
         n = first_write;
@@ -148,6 +150,53 @@ static void check_ecs_verdict(void) {
     message_unref(msg);
 }
 
+static struct tcp_client *new_test_client(void) {
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    close(fds[1]);
+    struct tcp_client *client = xcalloc(1, sizeof(*client));
+    assert(source_add(&client->source, fds[0], SOURCE_TCP_CLIENT, EPOLLIN | EPOLLRDHUP));
+    client->active_at = now_msec();
+    list_insert_before(&clients, &client->node);
+    ++client_count;
+    return client;
+}
+
+static void check_tcp_clients(void) {
+    list_init(&clients);
+    list_init(&closed_clients);
+
+    /* Idle clients close; a client awaiting replies is re-armed instead. */
+    struct tcp_client *idle = new_test_client();
+    struct tcp_client *busy = new_test_client();
+    busy->refs = 1;
+    idle->active_at = busy->active_at = now_msec() - TCP_CLIENT_IDLE_MS - 1;
+    clients_expire();
+    assert(idle->source.closed && !busy->source.closed);
+    assert(client_count == 1 && clients.next == &busy->node);
+    clients_sweep();
+    assert(closed_clients.next == &closed_clients);
+
+    /* The least recently active client makes room unless it is busy. */
+    assert(!client_evict());
+    busy->refs = 0;
+    assert(client_evict() && busy->source.closed && !client_count);
+    clients_sweep();
+
+    /* A client that stops reading is closed at its output limit. */
+    struct tcp_client *slow = new_test_client();
+    static u8 reply[60000];
+    block_send = true;
+    client_queue_reply(slow, reply, sizeof(reply));
+    client_queue_reply(slow, reply, sizeof(reply));
+    assert(!slow->source.closed && clients_out_bytes == 2 * (2 + sizeof(reply)));
+    client_queue_reply(slow, reply, sizeof(reply));
+    assert(slow->source.closed && !clients_out_bytes && !slow->out_head);
+    block_send = false;
+    clients_sweep();
+    assert(closed_clients.next == &closed_clients && !client_count);
+}
+
 int main(void) {
     for (int linger = 0; linger <= 1; ++linger) {
         check_cancel(linger, 3, true);
@@ -155,6 +204,7 @@ int main(void) {
         check_cancel(linger, 0, false);
     }
     check_ecs_verdict();
-    puts("server: canceled writes and ECS verdict isolation: PASS");
+    check_tcp_clients();
+    puts("server: canceled writes, ECS verdict isolation, TCP client limits: PASS");
     return 0;
 }
