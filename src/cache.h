@@ -2,6 +2,11 @@
 
 /* DNS response and tag:none verdict caches. */
 #include "core.h"
+#include "dns.h"
+
+/* Larger replies are not cached, so a few huge answers (e.g. TXT records over
+ * TCP) cannot pin most of the memory; cache_get output needs this capacity. */
+#define CACHE_MSG_MAXSIZE DNS_EDNS_MAXSIZE
 
 void cache_init(void);
 struct message *cache_get(const void *query, int qnamelen,

@@ -163,7 +163,8 @@ struct message *cache_get(const void *query, int qnamelen,
 }
 
 bool cache_add(void *reply, size_t len, int qnamelen, i32 *ttl) {
-    if (!g_config.cache_size || !dns_is_good(reply) || cache_ignored(reply, qnamelen)) return false;
+    if (!g_config.cache_size || len > CACHE_MSG_MAXSIZE || qnamelen > UINT8_MAX) return false;
+    if (!dns_is_good(reply) || cache_ignored(reply, qnamelen)) return false;
     if (dns_ecs_status(reply, (ssize_t)len, qnamelen) != 0) return false;
     i32 value = dns_get_ttl(reply, (ssize_t)len, qnamelen,
         g_config.cache_nodata_ttl, g_config.cache_min_ttl, g_config.cache_max_ttl);
@@ -178,7 +179,6 @@ bool cache_add(void *reply, size_t len, int qnamelen, i32 *ttl) {
     }
     while (cache_count >= g_config.cache_size && !list_empty(&cache_lru))
         cache_remove(container_of(cache_lru.prev, struct cache_entry, lru));
-    if (len > UINT16_MAX || qnamelen > UINT8_MAX) return false;
     struct cache_entry *e = xmalloc(sizeof(*e) + len);
     e->update_time = time(NULL);
     e->hash = hash;
@@ -213,6 +213,10 @@ static void cache_load(void) {
             question_end > h.msg_len) {
             log_warning("invalid entry in cache db %s", g_config.cache_db);
             break;
+        }
+        if (h.msg_len > CACHE_MSG_MAXSIZE) {
+            if (fseek(file, h.msg_len, SEEK_CUR) != 0) break;
+            continue;
         }
         struct cache_entry *e = xmalloc(sizeof(*e) + h.msg_len);
         if (fread(e->msg, h.msg_len, 1, file) != 1) { free(e); break; }

@@ -73,12 +73,29 @@ static void check_stale_boundaries(void) {
     assert(!cache_add(reply, sizeof(reply), 3, &ttl));
 }
 
+static void check_size_limit(void) {
+    static u8 reply[CACHE_MSG_MAXSIZE + 1];
+    const u8 head[] = {
+        0,1,0x81,0x80,0,1,0,1,0,0,0,0,1,'b',0,0,16,0,1,
+        0xc0,0x0c,0,16,0,1,0,0,0,60,
+    };
+    i32 ttl;
+    memcpy(reply, head, sizeof(head));
+    for (size_t len = CACHE_MSG_MAXSIZE; len <= CACHE_MSG_MAXSIZE + 1; ++len) {
+        u16 rdlen = (u16)(len - sizeof(head) - 2);
+        reply[sizeof(head)] = (u8)(rdlen >> 8);
+        reply[sizeof(head) + 1] = (u8)rdlen;
+        assert(cache_add(reply, len, 3, &ttl) == (len == CACHE_MSG_MAXSIZE));
+    }
+}
+
 int main(void) {
     g_config.cache_size = 8;
     g_config.verdict_cache_size = 8;
     cache_init();
     check_verdict_case();
     check_stale_boundaries();
-    puts("cache: case-insensitive verdicts and stale boundaries: PASS");
+    check_size_limit();
+    puts("cache: case-insensitive verdicts, stale boundaries, size limit: PASS");
     return 0;
 }
